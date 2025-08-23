@@ -302,6 +302,12 @@ detect_base_branch() {
   # If base branch specified, use it
   [ -n "$BASE_BRANCH" ] && echo "$BASE_BRANCH" && return 0
 
+  # Try configured default first if it exists
+  if [ -n "$DEFAULT_BASE_BRANCH" ] && git show-ref --verify --quiet "refs/heads/$DEFAULT_BASE_BRANCH"; then
+    echo "$DEFAULT_BASE_BRANCH"
+    return 0
+  fi
+
   # Try common base branches in order of preference
   local candidates=("main" "develop" "master")
   for candidate in "${candidates[@]}"; do

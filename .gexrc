@@ -8,7 +8,6 @@
 # Branch types for 'gex start' command (comma-separated)
 
 # Default base branch for new branches
-default_base_branch = main
 
 # Automatically sync base branch before creating new branch
 auto_sync = true
@@ -29,3 +28,4 @@ auto_push = false
 # branch_types = feature,bugfix,hotfix,release,support
 # default_base_branch = develop
 branch_types = features,patches,hotfix,chore
+default_base_branch = develop
