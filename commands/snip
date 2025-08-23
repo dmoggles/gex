@@ -1,0 +1,484 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# gex snip - Smart commit cherry-picking to avoid rebase conflicts
+#
+# Features:
+#   - Cherry-pick single commits onto latest base branch (main/develop)
+#   - Move current branch pointer to avoid rebase conflicts
+#   - Auto-sync base branch before cherry-picking
+#   - Safety checks and conflict resolution guidance
+#   - Support for custom base branches and commit selection
+#   - Option to keep original branch or create new branch
+#   - Dry run mode for previewing actions
+#
+# Use Case:
+#   You're on a divergent branch with commits, but main has moved forward.
+#   Instead of rebasing (which might have many conflicts), cherry-pick your
+#   latest commit onto the current main and move your branch there.
+#
+# Usage:
+#   gex snip [options]
+#   gex snip --onto=develop
+#   gex snip --commit=HEAD~1
+#   gex snip --keep-original --branch=feature-v2
+#
+# Options:
+#   --onto=<branch>       Target base branch (default: auto-detect main/develop)
+#   --commit=<ref>        Commit to cherry-pick (default: HEAD)
+#   --no-pull             Don't sync base branch with remote first
+#   --keep-original       Keep original branch, create new branch instead
+#   --branch=<name>       Name for new branch (with --keep-original)
+#   --force               Force move branch even if it would lose commits
+#   --dry-run             Show what would be done without executing
+#   -h, --help            Show usage
+#
+# Examples:
+#   gex snip                                 # Snip HEAD onto main
+#   gex snip --onto=develop                  # Snip onto develop instead
+#   gex snip --commit=HEAD~1                 # Snip specific commit
+#   gex snip --keep-original --branch=fix-v2 # Keep original, create new branch
+#   gex snip --force                         # Force move even if losing commits
+#   gex snip --dry-run                       # Preview actions
+#
+# Safety Features:
+#   - Validates commit exists and is reachable
+#   - Checks for uncommitted changes
+#   - Warns if operation would lose commits
+#   - Provides recovery instructions on failure
+#   - Shows clear diff of what's being moved
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GEX_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# shellcheck source=../lib/core.sh
+source "$GEX_ROOT/lib/core.sh"
+# shellcheck source=../lib/git.sh
+source "$GEX_ROOT/lib/git.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: gex snip [options]
+
+Cherry-pick a commit onto the latest base branch and move your branch pointer,
+avoiding the conflicts that often come with rebasing divergent branches.
+
+Options:
+  --onto=<branch>       Target base branch (default: auto-detect main/develop/master)
+  --commit=<ref>        Commit to cherry-pick (default: HEAD)
+  --no-pull             Don't sync base branch with remote first
+  --keep-original       Keep original branch, create new branch instead
+  --branch=<name>       Name for new branch (with --keep-original)
+  --force               Force move branch even if it would lose commits
+  --dry-run             Show what would be done without executing
+  -h, --help            Show this help
+
+Examples:
+  gex snip                                 # Move HEAD commit to latest main
+  gex snip --onto=develop                  # Target develop instead of main
+  gex snip --commit=HEAD~1                 # Move specific commit
+  gex snip --keep-original --branch=fix-v2 # Create new branch, keep original
+  gex snip --force                         # Force even if losing commits
+  gex snip --dry-run                       # Preview what would happen
+
+Use Case:
+  When your branch has diverged from main and you want to move just your
+  latest commit(s) to the current main without dealing with rebase conflicts.
+
+  Before:     main      your-branch
+              |         |
+              A---B---C---D (your commit)
+                   \
+                    E---F (conflicts with B,C)
+
+  After:      main              your-branch
+              |                 |
+              A---B---C---------D' (cherry-picked)
+                   \
+                    E---F
+
+Safety:
+  - Warns if operation would lose commits from your branch
+  - Validates all commits exist before starting
+  - Provides recovery instructions if cherry-pick fails
+  - Shows exact commits being moved and their diffs
+
+Configuration:
+  Set defaults in ~/.config/gex/config or .gexrc:
+    default_base_branch = main
+    auto_sync = true
+EOF
+}
+
+# Require git repository
+gex_require_git_repo
+
+# -------------------------
+# Configuration & Defaults
+# -------------------------
+TARGET_BRANCH=""
+COMMIT_TO_SNIP="HEAD"
+PULL_LATEST=1
+KEEP_ORIGINAL=0
+NEW_BRANCH_NAME=""
+FORCE_MOVE=0
+DRY_RUN=0
+
+# Load configuration
+load_config() {
+  local default_base=""
+  local auto_sync=""
+
+  # Safely get config values
+  if command -v gex_config_get >/dev/null 2>&1; then
+    default_base="$(gex_config_get default_base_branch 2>/dev/null || true)"
+    auto_sync="$(gex_config_get auto_sync 2>/dev/null || true)"
+  fi
+
+  # Apply config values if they exist
+  if [ -n "$default_base" ] && [ "$default_base" != "" ]; then
+    TARGET_BRANCH="$default_base"
+  fi
+
+  if [ "$auto_sync" = "false" ]; then
+    PULL_LATEST=0
+  fi
+}
+
+# -------------------------
+# Parse Arguments
+# -------------------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --onto=*) TARGET_BRANCH="${1#--onto=}";;
+    --onto) shift; TARGET_BRANCH="$1";;
+    --commit=*) COMMIT_TO_SNIP="${1#--commit=}";;
+    --commit) shift; COMMIT_TO_SNIP="$1";;
+    --no-pull) PULL_LATEST=0;;
+    --keep-original) KEEP_ORIGINAL=1;;
+    --branch=*) NEW_BRANCH_NAME="${1#--branch=}";;
+    --branch) shift; NEW_BRANCH_NAME="$1";;
+    --force) FORCE_MOVE=1;;
+    --dry-run) DRY_RUN=1;;
+    -h|--help) usage; exit 0;;
+    --) shift; break;;
+    -*) gex_die "Unknown option: $1";;
+    *) gex_die "Unexpected argument: $1";;
+  esac
+  shift
+done
+
+# Load config after parsing arguments
+load_config
+
+# -------------------------
+# Validation & Setup
+# -------------------------
+
+# Check if we're in detached HEAD
+if gex_git_is_detached; then
+  gex_die "Cannot snip from detached HEAD state. Check out a branch first."
+fi
+
+# Get current branch
+CURRENT_BRANCH="$(gex_git_current_branch)"
+[ -n "$CURRENT_BRANCH" ] || gex_die "Could not determine current branch"
+
+# Detect target branch if not specified
+detect_base_branch() {
+  # Try common base branches in order of preference
+  local candidates=("main" "develop" "master")
+  for candidate in "${candidates[@]}"; do
+    if git show-ref --verify --quiet "refs/heads/$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  gex_die "Could not auto-detect base branch. Please specify with --onto="
+}
+
+TARGET_BRANCH="${TARGET_BRANCH:-$(detect_base_branch)}"
+
+# Validate target branch exists
+if ! git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH"; then
+  gex_die "Target branch '$TARGET_BRANCH' does not exist"
+fi
+
+# Validate commit exists
+if ! git rev-parse --verify "$COMMIT_TO_SNIP" >/dev/null 2>&1; then
+  gex_die "Commit '$COMMIT_TO_SNIP' does not exist"
+fi
+
+# Get commit hash
+COMMIT_HASH="$(git rev-parse "$COMMIT_TO_SNIP")"
+COMMIT_SHORT="$(git rev-parse --short "$COMMIT_HASH")"
+
+# Ensure we're not trying to snip the target branch itself
+if [ "$CURRENT_BRANCH" = "$TARGET_BRANCH" ]; then
+  gex_die "Cannot snip from target branch '$TARGET_BRANCH' onto itself"
+fi
+
+# Check for uncommitted changes
+if [ -n "$(git status --porcelain)" ]; then
+  gex_die "Working directory not clean. Commit or stash changes first."
+fi
+
+gex_debug "Current branch: $CURRENT_BRANCH"
+gex_debug "Target branch: $TARGET_BRANCH"
+gex_debug "Commit to snip: $COMMIT_HASH ($COMMIT_SHORT)"
+
+# -------------------------
+# Safety Checks
+# -------------------------
+
+# Check if we would lose commits
+check_for_lost_commits() {
+  # Commits that would be lost: commits on current branch after the snip commit
+  local lost_commits
+  lost_commits="$(git rev-list "$COMMIT_HASH..$CURRENT_BRANCH" 2>/dev/null || echo "")"
+
+  if [ -n "$lost_commits" ]; then
+    local count
+    count="$(echo "$lost_commits" | wc -l | tr -d ' ')"
+    gex_warn "This operation would lose $count commit(s) after $COMMIT_SHORT:"
+    echo "$lost_commits" | while read -r commit; do
+      if [ -n "$commit" ]; then
+        gex_warn "  $(git log --oneline -1 "$commit")"
+      fi
+    done
+
+    if [ $FORCE_MOVE -eq 0 ] && [ $DRY_RUN -eq 0 ]; then
+      echo -n "Continue anyway? [y/N] "
+      read -r confirm
+      case "$confirm" in
+        [yY]|[yY][eE][sS]) ;;
+        *) gex_die "Aborted by user";;
+      esac
+    elif [ $FORCE_MOVE -eq 0 ]; then
+      gex_info "Would require --force to proceed (due to lost commits)"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# Check if commit is already in target branch
+if git merge-base --is-ancestor "$COMMIT_HASH" "$TARGET_BRANCH" 2>/dev/null; then
+  gex_warn "Commit $COMMIT_SHORT is already in $TARGET_BRANCH"
+  if [ $DRY_RUN -eq 0 ]; then
+    echo -n "Continue anyway? [y/N] "
+    read -r confirm
+    case "$confirm" in
+      [yY]|[yY][eE][sS]) ;;
+      *) gex_die "Aborted by user";;
+    esac
+  fi
+fi
+
+# -------------------------
+# Information Display
+# -------------------------
+
+show_snip_info() {
+  echo "Snip Operation Summary:"
+  echo "  Current branch:    $CURRENT_BRANCH"
+  echo "  Target branch:     $TARGET_BRANCH"
+  echo "  Commit to snip:    $COMMIT_SHORT"
+  echo "  Commit message:    $(git log --format='%s' -1 "$COMMIT_HASH")"
+  echo "  Author:            $(git log --format='%an <%ae>' -1 "$COMMIT_HASH")"
+  echo "  Date:              $(git log --format='%ad' --date=short -1 "$COMMIT_HASH")"
+
+  if [ $KEEP_ORIGINAL -eq 1 ]; then
+    branch_name="${NEW_BRANCH_NAME:-${CURRENT_BRANCH}-snipped}"
+    echo "  New branch:        $branch_name (original kept)"
+  else
+    echo "  Branch movement:   $CURRENT_BRANCH will point to cherry-picked commit"
+  fi
+
+  if [ $PULL_LATEST -eq 1 ]; then
+    echo "  Sync target:       Will pull latest $TARGET_BRANCH from remote"
+  fi
+
+  # Show what's in the commit
+  echo
+  echo "Commit contents:"
+  git show --stat "$COMMIT_HASH" | sed 's/^/  /'
+  echo
+}
+
+# -------------------------
+# Core Operations
+# -------------------------
+
+sync_target_branch() {
+  local branch="$1"
+
+  gex_info "Syncing $branch with remote"
+  git checkout "$branch" >/dev/null 2>&1
+
+  if git rev-parse --verify "origin/$branch" >/dev/null 2>&1; then
+    git pull --ff-only origin "$branch" || {
+      gex_warn "Could not fast-forward $branch. Continuing with current state."
+    }
+  else
+    gex_info "No remote tracking branch for $branch"
+  fi
+}
+
+perform_cherry_pick() {
+  local commit="$1"
+
+  gex_info "Cherry-picking $COMMIT_SHORT onto $TARGET_BRANCH"
+
+  if ! git cherry-pick "$commit"; then
+    echo
+    gex_error "Cherry-pick failed with conflicts!"
+    echo
+    echo "To resolve:"
+    echo "  1. Fix conflicts in the listed files"
+    echo "  2. git add <resolved-files>"
+    echo "  3. git cherry-pick --continue"
+    echo "  4. gex snip --onto=$TARGET_BRANCH --commit=$commit  # Re-run to complete"
+    echo
+    echo "To abort:"
+    echo "  git cherry-pick --abort"
+    echo "  git checkout $CURRENT_BRANCH"
+    echo
+    exit 1
+  fi
+}
+
+create_or_move_branch() {
+  local new_commit
+  new_commit="$(git rev-parse HEAD)"
+
+  if [ $KEEP_ORIGINAL -eq 1 ]; then
+    # Create new branch
+    branch_name="${NEW_BRANCH_NAME:-${CURRENT_BRANCH}-snipped}"
+    gex_info "Creating new branch: $branch_name"
+    git checkout -b "$branch_name" >/dev/null 2>&1
+    echo
+    gex_info "New branch '$branch_name' created pointing to cherry-picked commit"
+    gex_info "Original branch '$CURRENT_BRANCH' unchanged"
+  else
+    # Move original branch
+    gex_info "Moving $CURRENT_BRANCH to point to cherry-picked commit"
+    git branch -f "$CURRENT_BRANCH" "$new_commit"
+    git checkout "$CURRENT_BRANCH" >/dev/null 2>&1
+    echo
+    gex_info "Branch '$CURRENT_BRANCH' now points to cherry-picked commit"
+  fi
+}
+
+# -------------------------
+# Dry Run Mode
+# -------------------------
+
+if [ $DRY_RUN -eq 1 ]; then
+  show_snip_info
+
+  if ! check_for_lost_commits; then
+    echo "DRY RUN - Would fail due to lost commits (use --force to override)"
+    exit 1
+  fi
+
+  echo "DRY RUN - Would execute:"
+
+  if [ $PULL_LATEST -eq 1 ]; then
+    echo "  1. git checkout $TARGET_BRANCH"
+    echo "  2. git pull --ff-only origin $TARGET_BRANCH"
+  else
+    echo "  1. git checkout $TARGET_BRANCH"
+  fi
+
+  echo "  3. git cherry-pick $COMMIT_HASH"
+
+  if [ $KEEP_ORIGINAL -eq 1 ]; then
+    branch_name="${NEW_BRANCH_NAME:-${CURRENT_BRANCH}-snipped}"
+    echo "  4. git checkout -b $branch_name"
+  else
+    echo "  4. git branch -f $CURRENT_BRANCH HEAD"
+    echo "  5. git checkout $CURRENT_BRANCH"
+  fi
+
+  echo
+  echo "Result: Commit $COMMIT_SHORT would be available on latest $TARGET_BRANCH"
+  exit 0
+fi
+
+# -------------------------
+# Execute Operation
+# -------------------------
+
+show_snip_info
+
+# Safety check for lost commits
+if ! check_for_lost_commits; then
+  gex_die "Operation would lose commits. Use --force to override."
+fi
+
+# Store original position for recovery
+ORIGINAL_BRANCH="$CURRENT_BRANCH"
+ORIGINAL_COMMIT="$(git rev-parse "$CURRENT_BRANCH")"
+
+# Set up error recovery
+cleanup_on_error() {
+  gex_error "Operation failed. Restoring original state..."
+  git checkout "$ORIGINAL_BRANCH" >/dev/null 2>&1 || true
+  git reset --hard "$ORIGINAL_COMMIT" >/dev/null 2>&1 || true
+}
+trap cleanup_on_error ERR
+
+# Step 1: Sync target branch
+if [ $PULL_LATEST -eq 1 ]; then
+  sync_target_branch "$TARGET_BRANCH"
+else
+  git checkout "$TARGET_BRANCH" >/dev/null 2>&1
+fi
+
+# Step 2: Cherry-pick the commit
+perform_cherry_pick "$COMMIT_HASH"
+
+# Step 3: Create/move branch
+create_or_move_branch
+
+# Clear error trap
+trap - ERR
+
+# -------------------------
+# Success Summary
+# -------------------------
+
+echo
+gex_info "Snip operation completed successfully!"
+echo
+echo "Summary:"
+if [ $KEEP_ORIGINAL -eq 1 ]; then
+  branch_name="${NEW_BRANCH_NAME:-${CURRENT_BRANCH}-snipped}"
+  echo "  • Created new branch: $branch_name"
+  echo "  • Original branch preserved: $ORIGINAL_BRANCH"
+else
+  echo "  • Moved branch: $CURRENT_BRANCH"
+  echo "  • Original position: $(git rev-parse --short "$ORIGINAL_COMMIT")"
+fi
+echo "  • Cherry-picked commit: $COMMIT_SHORT"
+echo "  • Now on latest: $TARGET_BRANCH"
+
+echo
+echo "Next steps:"
+echo "  # Continue working on your updated branch"
+echo "  git add . && git commit -m \"your changes\""
+if [ $KEEP_ORIGINAL -eq 0 ]; then
+  echo "  gex publish  # Push the updated branch"
+fi
+echo
+echo "Recovery (if needed):"
+if [ $KEEP_ORIGINAL -eq 1 ]; then
+  echo "  git checkout $ORIGINAL_BRANCH  # Return to original"
+else
+  echo "  git reset --hard $ORIGINAL_COMMIT  # Restore original position"
+fi
+
+# End of snip command

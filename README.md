@@ -1,9 +1,9 @@
 # gex (Git eXtended)
 
 A lightweight, extensible command‑line tool that layers higher-level workflows on top of Git.
-The initial focus is on a powerful `graph` command for quickly visualizing commit history across multiple branches with flexible filtering, highlighting, and interactive selection, plus essential workflow commands like `start`, `publish`, and `wip`.
+The initial focus is on a powerful `graph` command for quickly visualizing commit history across multiple branches with flexible filtering, highlighting, and interactive selection, plus essential workflow commands like `start`, `publish`, `snip`, and `wip`.
 
-> Status: Core functionality implemented. Commands available: `graph`, `start`, `publish`, `wip`, `config`.
+> Status: Core functionality implemented. Commands available: `graph`, `start`, `publish`, `snip`, `wip`, `config`.
 
 ---
 
@@ -44,6 +44,7 @@ While `git` already provides rich plumbing, day‑to‑day workflows often repea
 ### Branch Management
 - **start**: Create branches with smart naming conventions (`gex start feature my-feature`)
 - **publish**: Push branches with upstream tracking and safety checks
+- **snip**: Cherry-pick commits to avoid rebase conflicts (`gex snip --onto=main`)
 - **wip**: Quick work-in-progress commits with easy rollback
 
 ### Configuration
@@ -145,6 +146,30 @@ Examples:
     gex publish --to=origin/develop          # Push to origin/develop
     gex publish --force-with-lease           # Safe force push
 
+### snip
+
+Cherry-pick commits onto the latest base branch to avoid rebase conflicts.
+
+    gex snip [options]
+
+Option                  | Description
+-----------------------|------------
+--onto=<branch>        | Target base branch (default: auto-detect main/develop/master)
+--commit=<ref>         | Commit to cherry-pick (default: HEAD)
+--no-pull              | Don't sync base branch with remote first
+--keep-original        | Keep original branch, create new branch instead
+--branch=<name>        | Name for new branch (with --keep-original)
+--force                | Force move branch even if it would lose commits
+--dry-run              | Preview actions without executing
+
+Examples:
+
+    gex snip                                 # Move HEAD commit to latest main
+    gex snip --onto=develop                  # Target develop instead of main
+    gex snip --commit=HEAD~1                 # Move specific commit
+    gex snip --keep-original --branch=fix-v2 # Create new branch, keep original
+    gex snip --force                         # Force even if losing commits
+
 ### wip
 
 Create and manage work-in-progress commits with easy rollback.
@@ -194,6 +219,10 @@ Make your changes and commit:
 Publish your branch:
 
     gex publish
+
+Cherry-pick your commit to avoid rebase conflicts:
+
+    gex snip                              # Move current commit to latest main
 
 Quick work-in-progress commit:
 

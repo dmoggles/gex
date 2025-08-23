@@ -98,6 +98,7 @@ Run 'gex <command> --help' for command-specific options.
 Examples:
   gex start feature my-awesome-feature
   gex publish                           # Push current branch
+  gex snip                              # Cherry-pick commit to avoid rebase conflicts
   gex graph
   gex graph --branches main,develop
   gex graph --interactive
