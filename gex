@@ -28,7 +28,7 @@ set -euo pipefail
 
 [ "${GEX_TRACE:-0}" = "1" ] && set -x
 
-GEX_VERSION="0.1.0"
+GEX_VERSION="1.0.0"
 
 # Resolve root directory (directory containing this script)
 GEX_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -80,6 +80,8 @@ print_usage() {
   cat <<EOF
 ${_CLR_BOLD}gex${_CLR_RST} - Git eXtended tooling (version $GEX_VERSION)
 
+A powerful Git workflow automation tool with safety features and smart defaults.
+
 Usage:
   gex [global-options] <command> [args]
 
@@ -90,26 +92,51 @@ Global Options:
   --no-color        Disable color output (also NO_COLOR=1)
   --list            List available internal and external commands
 
-Commands (internal):
+Core Commands:
 $(list_internal_commands | sed "s/^/  /")
 
-Run 'gex <command> --help' for command-specific options.
+Essential Workflows:
+  gex start feature my-feature          # Create feature branch with smart naming
+  gex publish                          # Push branch with safety checks
+  gex snip                             # Cherry-pick to avoid rebase conflicts
+  gex wip "checkpoint"                 # Quick work-in-progress commit
+  gex graph --interactive              # Visual commit history explorer
 
-Examples:
-  gex start feature my-awesome-feature
-  gex publish                           # Push current branch
-  gex snip                              # Cherry-pick commit to avoid rebase conflicts
-  gex graph
-  gex graph --branches main,develop
-  gex graph --interactive
+Command Details:
+  ${_CLR_BOLD}start${_CLR_RST}    - Create branches with naming conventions and base branch detection
+  ${_CLR_BOLD}publish${_CLR_RST}  - Push branches safely with upstream tracking and force-push protection
+  ${_CLR_BOLD}snip${_CLR_RST}     - Cherry-pick commits onto latest base branch (avoid merge conflicts)
+  ${_CLR_BOLD}wip${_CLR_RST}      - Quick checkpointing with easy rollback (gex wip --undo)
+  ${_CLR_BOLD}graph${_CLR_RST}    - Powerful commit visualization with filtering and highlighting
+  ${_CLR_BOLD}config${_CLR_RST}   - Manage settings and workflow presets
 
-Environment:
+Configuration:
+  Global: ~/.config/gex/config
+  Repo:   .gexrc (in repository root)
+
+  # Set custom branch types
+  gex config set branch_types "epic,story,task,bugfix"
+
+  # Use workflow presets
+  gex config use features    # feature/bugfix/hotfix workflow
+  gex config use patches     # features/patches workflow
+
+Environment Variables:
   NO_COLOR=1   Disable colors
   GEX_DEBUG=1  Debug logs
   GEX_TRACE=1  Shell trace (set -x)
 
+Get Started:
+  gex start feature my-awesome-feature
+  # ... make changes ...
+  gex publish
+
+Run 'gex <command> --help' for detailed command options and examples.
+
 Project root: $GEX_ROOT
 Config dir:   $GEX_CONFIG_DIR
+
+For comprehensive documentation: https://github.com/dmoggles/gex
 EOF
 }
 

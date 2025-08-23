@@ -1,401 +1,968 @@
 # gex (Git eXtended)
 
-A lightweight, extensible command‑line tool that layers higher-level workflows on top of Git.
-The initial focus is on a powerful `graph` command for quickly visualizing commit history across multiple branches with flexible filtering, highlighting, and interactive selection, plus essential workflow commands like `start`, `publish`, `snip`, and `wip`.
+A lightweight, extensible command-line tool that enhances Git workflows with intelligent automation and safety features.
 
-> Status: Core functionality implemented. Commands available: `graph`, `start`, `publish`, `snip`, `wip`, `config`.
+**gex** provides high-level commands that wrap common Git operations, making complex workflows simple and safe while preserving the full power of Git underneath.
+
+> **Status**: Production ready. Core commands: `graph`, `start`, `publish`, `snip`, `wip`, `config`
+
+---
+
+## Table of Contents
+
+- [Why gex?](#why-gex)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Commands](#commands)
+  - [graph - Visualize commit history](#graph)
+  - [start - Create branches with smart naming](#start)
+  - [publish - Push branches safely](#publish)
+  - [snip - Cherry-pick to avoid conflicts](#snip)
+  - [wip - Quick work-in-progress commits](#wip)
+  - [config - Manage configuration](#config)
+- [Configuration](#configuration)
+- [Workflows](#workflows)
+- [Advanced Usage](#advanced-usage)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
 
 ---
 
 ## Why gex?
 
-While `git` already provides rich plumbing, day‑to‑day workflows often repeat patterns:
-- Viewing a meaningful multi-branch commit graph
-- Creating branches with consistent naming conventions
-- Publishing branches with proper upstream tracking
-- Making quick work-in-progress commits
-- Focusing on a subset of branches (e.g., feature branches related to an epic)
-- Highlighting important branches (like `main`, `release/*`)
-- Quickly limiting output by author, date, merges, etc.
-- Interactively selecting branches with fuzzy search
+Git is powerful but verbose. Common developer workflows involve repetitive command sequences that can be error-prone:
 
-`gex` provides commands that wrap and augment common git operations, making workflows faster and more discoverable.
+**Before gex:**
+```bash
+# Creating a feature branch
+git checkout main
+git pull
+git checkout -b feature/user-auth
+# ... make changes ...
+git add .
+git commit -m "Add user authentication"
+git push -u origin feature/user-auth
+```
 
----
+**With gex:**
+```bash
+# Creating a feature branch
+gex start feature user-auth
+# ... make changes ...
+git add .
+git commit -m "Add user authentication"
+gex publish
+```
 
-## Features (Current)
-
-### Graph Command
-- Branch pattern selection: `--branches "feature/*,hotfix/*"`
-- Exclusions by glob: `--exclude "wip/*"`
-- Include remotes (`--remotes`) or everything (`--all`)
-- Time and range filtering: `--since`, `--until`
-- Limit commit count: `--max`
-- Filter by author: `--author`
-- Show only merges: `--merges-only`
-- Highlight specific branches: `--highlight main,develop`
-- Interactive mode (fzf): `--interactive`
-- ASCII or basic Unicode graph lines: `--style ascii|unicode`
-- Decoration control: `--decorate short|full|no`
-- Disable color with `--no-color`
-- Safe behavior when HEAD is detached (ensures it's shown)
-- Clean failure messages if patterns match nothing
-
-### Branch Management
-- **start**: Create branches with smart naming conventions (`gex start feature my-feature`)
-- **publish**: Push branches with upstream tracking and safety checks
-- **snip**: Cherry-pick commits to avoid rebase conflicts (`gex snip --onto=main`)
-- **wip**: Quick work-in-progress commits with easy rollback
-
-### Configuration
-- Global and per-repository configuration support
-- Customizable branch types and naming patterns
-- Workflow presets for different project styles
-
----
-
-## Planned (Short Term Roadmap)
-
-### Graph Enhancements
-- Dimming (faint color) of non-highlighted branches
-- JSON output mode for tooling (`--json`)
-- Rich Unicode graph with persistent branch color assignment
-- Intelligent subject line truncation (`--subject-width`)
-
-### Additional Commands
-- **sync**: Smart branch synchronization with remotes
-- **prune**: Clean up stale branches
-- **squash**: Interactive commit squashing
-
-### Integrations
-- Pull/merge request creation support
-- Issue tracker integration (GitHub, GitLab, Jira)
-
-Longer-term:
-- Plugin system for user-defined commands
-- Commit set diff utilities (e.g., "what's on branch X but not Y?")
-- Release & changelog automation
+**Key benefits:**
+- **Safety first**: Validates operations before execution, prevents common mistakes
+- **Smart defaults**: Auto-detects branch names, remotes, and base branches
+- **Workflow consistency**: Enforces naming conventions and best practices
+- **Conflict avoidance**: Cherry-pick commits to avoid painful rebases
+- **Powerful visualization**: Rich commit graph with filtering and highlighting
+- **Configuration-driven**: Adapts to different team workflows and conventions
 
 ---
 
 ## Installation
 
-Clone the repository somewhere on your machine (example assumes `~/gex`):
+### Method 1: Clone and Add to PATH
 
-    git clone <REPO_URL> ~/gex
-    cd ~/gex
-    chmod +x gex commands/*
+```bash
+git clone https://github.com/dmoggles/gex.git ~/gex
+cd ~/gex
+chmod +x gex commands/*
 
-Add to your shell PATH (choose one):
+# Add to your shell configuration
+echo 'export PATH="$HOME/gex:$PATH"' >> ~/.bashrc  # or ~/.zshrc
+source ~/.bashrc  # or restart your shell
+```
 
-Bash / Zsh:
+### Method 2: Symlink to Existing PATH
 
-    echo 'export PATH="$HOME/gex:$PATH"' >> ~/.bashrc   # or ~/.zshrc
-    # Then reload your shell
-    exec $SHELL -l
+```bash
+git clone https://github.com/dmoggles/gex.git ~/gex
+cd ~/gex
+chmod +x gex commands/*
+ln -s ~/gex/gex /usr/local/bin/gex
+```
 
-Fish:
+### Verification
 
-    set -Ux PATH $HOME/gex $PATH
-
-(Alternatively, symlink `gex` into a directory already on PATH.)
-
-### start
-
-Create branches with smart naming conventions and workflow automation.
-
-    gex start <type> <name> [options]
-
-Option               | Description
---------------------|------------
---from=<branch>     | Base branch (default: auto-detect main/develop)
---issue=<number>    | Issue number to include in branch name
---no-switch         | Create branch but don't check it out
---no-sync           | Skip syncing base branch with remote
---push              | Push new branch and set upstream tracking
---interactive       | Interactive guided branch creation
---list-types        | Show available branch types
---dry-run           | Show what would be done without executing
-
-Examples:
-
-    gex start feature user-dashboard
-    gex start bugfix login-timeout --issue=456
-    gex start hotfix security-patch --from=release/v1.2 --push
-
-### publish
-
-Publish branches to remote repositories with safety checks and smart defaults.
-
-    gex publish [options]
-
-Option                  | Description
------------------------|------------
---remote=<name>        | Remote to push to (default: origin)
---branch=<name>        | Remote branch name (default: current branch)
---to=<remote/branch>   | Shorthand for --remote=<remote> --branch=<branch>
---force                | Force push (dangerous)
---force-with-lease     | Force push with lease (safer)
---no-set-upstream      | Don't set upstream tracking
---dry-run              | Preview actions without executing
-
-Examples:
-
-    gex publish                              # Push current branch to origin
-    gex publish --remote=upstream            # Push to upstream remote
-    gex publish --to=origin/develop          # Push to origin/develop
-    gex publish --force-with-lease           # Safe force push
-
-### snip
-
-Cherry-pick commits onto the latest base branch to avoid rebase conflicts.
-
-    gex snip [options]
-
-Option                  | Description
------------------------|------------
---onto=<branch>        | Target base branch (default: auto-detect main/develop/master)
---commit=<ref>         | Commit to cherry-pick (default: HEAD)
---no-pull              | Don't sync base branch with remote first
---keep-original        | Keep original branch, create new branch instead
---branch=<name>        | Name for new branch (with --keep-original)
---force                | Force move branch even if it would lose commits
---dry-run              | Preview actions without executing
-
-Examples:
-
-    gex snip                                 # Move HEAD commit to latest main
-    gex snip --onto=develop                  # Target develop instead of main
-    gex snip --commit=HEAD~1                 # Move specific commit
-    gex snip --keep-original --branch=fix-v2 # Create new branch, keep original
-    gex snip --force                         # Force even if losing commits
-
-### wip
-
-Create and manage work-in-progress commits with easy rollback.
-
-    gex wip [message] [options]
-
-Option     | Description
------------|------------
---undo     | Rollback the last WIP commit
---list     | List recent WIP commits
---push     | Push WIP commit (skips pre-commit hooks)
-
-Examples:
-
-    gex wip "checkpoint before refactor"
-    gex wip --undo                          # Rollback last WIP
-    gex wip --list                          # Show WIP history
-
-### config
-
-Manage gex configuration and workflow presets.
-
-    gex config <action> [options]
-
-Actions:
-- `set <key> <value>` - Set configuration value
-- `get <key>` - Get configuration value
-- `use <preset>` - Apply workflow preset
-- `list` - Show current configuration
-- `presets` - List available presets
+```bash
+gex --version
+gex --help
+```
 
 ---
 
 ## Quick Start
 
-### Basic Workflow
+### 1. Basic Workflow
 
-Create a new feature branch:
+```bash
+# Create a feature branch
+gex start feature user-dashboard
 
-    gex start feature my-awesome-feature
+# Make your changes
+echo "new feature" > feature.txt
+git add feature.txt
+git commit -m "Add user dashboard"
 
-Make your changes and commit:
+# Publish to remote
+gex publish
 
-    git add .
-    git commit -m "Add awesome feature"
+# View commit graph
+gex graph --branches "feature/*,main" --highlight main
+```
 
-Publish your branch:
+### 2. Work-in-Progress Pattern
 
-    gex publish
+```bash
+# Quick checkpoint before risky changes
+gex wip "before refactoring auth module"
 
-Cherry-pick your commit to avoid rebase conflicts:
+# Make experimental changes...
+# Something went wrong? Rollback instantly:
+gex wip --undo
 
-    gex snip                              # Move current commit to latest main
+# Or list recent WIP commits
+gex wip --list
+```
 
-Quick work-in-progress commit:
+### 3. Avoiding Rebase Conflicts
 
-    gex wip "checkpoint before lunch"
-
-Rollback the WIP commit:
-
-    gex wip --undo
-
-### Graph Visualization
-
-View commit history:
-
-    gex graph
-
-Filter to a subset of branches:
-
-    gex graph --branches main,develop
-
-Glob pattern:
-
-    gex graph --branches "feature/*"
-
-Highlight important branches:
-
-    gex graph --branches "feature/*,main" --highlight main
-
-Show only the last 100 commits affecting release branches:
-
-    gex graph --branches "release/*" --max 100
-
-Interactive branch picker (requires `fzf`):
-
-    gex graph --interactive
-
-View only merge commits from the last two weeks:
-
-    gex graph --since 2.weeks --merges-only
-
-Unicode graph glyphs:
-
-    gex graph --style unicode
-
-No colors (useful for logs):
-
-    gex graph --no-color
-
-### Configuration
-
-Set up workflow presets:
-
-    gex config use features    # Use feature/bugfix workflow
-    gex config use patches     # Use features/patches workflow
-
-Set custom branch types:
-
-    gex config set branch_types "epic,story,task,bugfix"
+```bash
+# Your branch diverged from main with potential conflicts
+gex snip --onto=main  # Cherry-pick your commit to latest main
+# No merge conflicts to resolve!
+```
 
 ---
 
-## Command Reference
+## Commands
 
-### graph
+## graph
 
-Visualize commit history with flexible filtering and highlighting.
+**Visualize commit history with powerful filtering and highlighting.**
 
-Option (long)        | Description
----------------------|------------
---branches <list>    | Comma-separated branch names or globs (e.g. `main,feature/*`)
---exclude <list>     | Comma-separated glob patterns to exclude
---remotes            | Include remote branches (in addition to local)
---all                | Include all local + remote (overrides `--branches` if none provided)
---since <rev|date>   | Lower time/revision bound (e.g. `2024-01-01`, `2.weeks`, `tagname`)
---until <rev|date>   | Upper bound (default: HEAD)
---max <n>            | Limit number of commits shown
---author <pattern>   | Filter commits by author (passed to `git log --author`)
---merges-only        | Only merge commits (`--merges`)
---style ascii|unicode| Graph drawing style (initial unicode is minimal substitution)
---no-color           | Disable color output
---highlight <list>   | Comma list of branches whose labels should be emphasized
---decorate <mode>    | `short`, `full`, or `no` for ref decorations
---interactive        | Use `fzf` multi-select to choose branches
---show-remote-labels | Keep remote labels even if a matching local branch exists (future refinement)
--h, --help           | Show usage
+The `graph` command provides a rich, filterable view of your Git history with branch highlighting, pattern matching, and interactive selection.
 
-Notes:
-- If no `--branches`, `--all`, or `--remotes` are supplied, only local branches are considered.
-- Patterns are simple globs; `*` matches any sequence.
-- Exclusions both remove branches from positive selection and add explicit `^ref` rev exclusions.
+### Syntax
+```bash
+gex graph [options]
+```
+
+### Key Features
+- **Branch filtering**: Show only branches matching patterns
+- **Interactive selection**: Use fzf for dynamic branch picking
+- **Highlighting**: Emphasize important branches
+- **Time filtering**: Limit by date ranges
+- **Author filtering**: Show commits by specific authors
+- **Merge filtering**: Focus on merge commits only
+
+### Options
+
+| Option | Description | Example |
+|--------|-------------|---------|
+| `--branches <patterns>` | Comma-separated branch patterns | `--branches "main,feature/*"` |
+| `--exclude <patterns>` | Exclude branch patterns | `--exclude "wip/*,temp/*"` |
+| `--all` | Include all local and remote branches | `--all` |
+| `--remotes` | Include remote branches | `--remotes` |
+| `--since <date>` | Show commits after date | `--since "2 weeks ago"` |
+| `--until <date>` | Show commits before date | `--until "2024-01-01"` |
+| `--author <pattern>` | Filter by author | `--author "john@example.com"` |
+| `--max <n>` | Limit number of commits | `--max 50` |
+| `--merges-only` | Show only merge commits | `--merges-only` |
+| `--highlight <branches>` | Highlight specific branches | `--highlight "main,develop"` |
+| `--interactive` | Interactive branch selection (requires fzf) | `--interactive` |
+| `--style <ascii\|unicode>` | Graph line style | `--style unicode` |
+| `--decorate <short\|full\|no>` | Ref name decoration | `--decorate short` |
+| `--no-color` | Disable colored output | `--no-color` |
+
+### Examples
+
+```bash
+# Basic usage - show all local branches
+gex graph
+
+# Show only feature branches and main
+gex graph --branches "feature/*,main"
+
+# Interactive branch selection
+gex graph --interactive
+
+# Show last 2 weeks of work by team
+gex graph --since "2 weeks ago" --author "team@company.com"
+
+# Focus on release branches with highlighting
+gex graph --branches "release/*,main" --highlight main
+
+# Show merge commits only
+gex graph --merges-only --max 20
+
+# Export-friendly format
+gex graph --no-color --style ascii > git-history.txt
+```
+
+### Pattern Matching
+- `*` matches any characters: `feature/*` matches `feature/auth`, `feature/ui`, etc.
+- Exact matches: `main` matches only the `main` branch
+- Multiple patterns: `"main,develop,feature/*"` (comma-separated, no spaces)
+
+---
+
+## start
+
+**Create branches with smart naming conventions and workflow automation.**
+
+The `start` command automates branch creation with consistent naming, base branch detection, and optional remote publishing.
+
+### Syntax
+```bash
+gex start <type> <name> [options]
+```
+
+### Key Features
+- **Smart naming**: Enforces consistent branch naming patterns
+- **Base branch detection**: Auto-detects main/develop/master
+- **Issue integration**: Include issue numbers in branch names
+- **Remote sync**: Optionally sync base branch before creating
+- **Immediate publishing**: Create and push in one command
+
+### Arguments
+
+| Argument | Description | Example |
+|----------|-------------|---------|
+| `<type>` | Branch type (configurable) | `feature`, `bugfix`, `hotfix`, `chore` |
+| `<name>` | Branch description (kebab-case) | `user-authentication`, `fix-login-bug` |
+
+### Options
+
+| Option | Description | Example |
+|--------|-------------|---------|
+| `--from=<branch>` | Base branch override | `--from=develop` |
+| `--issue=<number>` | Include issue number | `--issue=123` |
+| `--no-switch` | Create but don't check out | `--no-switch` |
+| `--no-sync` | Skip syncing base branch | `--no-sync` |
+| `--push` | Push and set upstream | `--push` |
+| `--interactive` | Interactive mode | `--interactive` |
+| `--list-types` | Show available types | `--list-types` |
+| `--dry-run` | Preview without executing | `--dry-run` |
+
+### Examples
+
+```bash
+# Basic feature branch
+gex start feature user-dashboard
+# Creates: feature/user-dashboard
+
+# Bug fix with issue number
+gex start bugfix login-timeout --issue=456
+# Creates: bugfix/456-login-timeout
+
+# Hotfix from specific branch
+gex start hotfix security-patch --from=release/v1.2
+# Creates: hotfix/security-patch (from release/v1.2)
+
+# Create and immediately publish
+gex start feature new-api --push
+# Creates and pushes: feature/new-api
+
+# Interactive mode
+gex start --interactive
+# Prompts for type, name, issue, etc.
+
+# See available branch types
+gex start --list-types
+```
+
+### Branch Types
+
+Default types: `feature`, `bugfix`, `hotfix`, `chore`, `docs`
+
+Customize via configuration:
+```bash
+gex config set branch_types "epic,story,task,bugfix"
+```
+
+### Issue Integration
+
+Automatic issue number extraction:
+```bash
+gex start feature "#123-user-auth"     # → feature/123-user-auth
+gex start bugfix "fix-login-#456"      # → bugfix/456-fix-login
+```
+
+---
+
+## publish
+
+**Publish branches to remote repositories with comprehensive safety checks.**
+
+The `publish` command safely pushes branches with automatic upstream tracking, force-push protection, and status validation.
+
+### Syntax
+```bash
+gex publish [options]
+```
+
+### Key Features
+- **Smart defaults**: Auto-detects current branch and origin remote
+- **Safety checks**: Validates remotes, warns about protected branches
+- **Force push protection**: Safer alternatives to dangerous operations
+- **Status awareness**: Shows ahead/behind information
+- **Flexible targeting**: Custom remotes and branch names
+
+### Options
+
+| Option | Description | Example |
+|--------|-------------|---------|
+| `--remote=<name>` | Target remote | `--remote=upstream` |
+| `--branch=<name>` | Remote branch name | `--branch=main` |
+| `--to=<remote/branch>` | Shorthand syntax | `--to=origin/develop` |
+| `--force` | Force push (dangerous) | `--force` |
+| `--force-with-lease` | Safer force push | `--force-with-lease` |
+| `--no-set-upstream` | Don't set tracking | `--no-set-upstream` |
+| `--dry-run` | Preview actions | `--dry-run` |
+
+### Examples
+
+```bash
+# Basic publish to origin
+gex publish
+# Pushes current branch to origin with upstream tracking
+
+# Publish to different remote
+gex publish --remote=upstream
+
+# Publish with different name on remote
+gex publish --branch=feature-v2
+
+# Shorthand for remote/branch
+gex publish --to=upstream/main
+
+# Safe force push (recommended)
+gex publish --force-with-lease
+
+# Preview what would happen
+gex publish --dry-run
+```
+
+### Safety Features
+
+**Protected Branch Warnings:**
+```bash
+gex publish --branch=main
+# WARNING: Target branch 'main' appears to be protected!
+# Continue? [y/N]
+```
+
+**Force Push Detection:**
+```bash
+gex publish
+# WARN: Remote branch has commits not in your local branch
+# This requires a force push, which can be dangerous
+# Force push with lease? [y/N]
+```
+
+**Status Information:**
+```bash
+gex publish --dry-run
+# Publishing Status:
+#   Local branch:   feature/auth
+#   Remote:         origin
+#   Target branch:  feature/auth
+#   Ahead:          2 commits
+#   Behind:         0 commits
+#   Status:         Ready to push
+```
+
+---
+
+## snip
+
+**Cherry-pick commits onto the latest base branch to avoid rebase conflicts.**
+
+The `snip` command solves the common problem of divergent branches by cherry-picking your commits onto the latest base branch, avoiding complex merge conflicts.
+
+### Syntax
+```bash
+gex snip [options]
+```
+
+### Key Features
+- **Conflict avoidance**: Cherry-pick instead of rebasing
+- **Smart targeting**: Auto-detects appropriate base branch
+- **Lost commit protection**: Warns before losing work
+- **Branch preservation**: Option to keep original branch
+- **Recovery guidance**: Clear instructions if conflicts occur
+
+### The Problem Solved
+
+```
+Before:     main          your-branch
+            |             |
+            A---B---C-----D (your commit)
+                 \
+                  E---F (conflicts with B,C)
+
+After:      main                  your-branch
+            |                     |
+            A---B---C---E---F-----D' (clean cherry-pick)
+                 \
+                  (original commits)
+```
+
+### Options
+
+| Option | Description | Example |
+|--------|-------------|---------|
+| `--onto=<branch>` | Target base branch | `--onto=main` |
+| `--commit=<ref>` | Specific commit to snip | `--commit=HEAD~1` |
+| `--no-pull` | Skip syncing base branch | `--no-pull` |
+| `--keep-original` | Keep original branch | `--keep-original` |
+| `--branch=<name>` | New branch name | `--branch=feature-v2` |
+| `--force` | Override safety warnings | `--force` |
+| `--dry-run` | Preview operation | `--dry-run` |
+
+### Examples
+
+```bash
+# Basic snip to latest main
+gex snip
+# Cherry-picks HEAD onto latest main, moves current branch
+
+# Snip to different base
+gex snip --onto=develop
+
+# Snip specific commit
+gex snip --commit=HEAD~2
+
+# Keep original branch, create new one
+gex snip --keep-original --branch=auth-v2
+
+# Preview the operation
+gex snip --dry-run
+```
+
+### Safety Features
+
+**Lost Commit Warnings:**
+```bash
+gex snip --commit=HEAD~1
+# WARN: This operation would lose 1 commit(s) after abc1234:
+# WARN:   def5678 Fix typo in documentation
+# Continue anyway? [y/N]
+```
+
+**Detailed Preview:**
+```bash
+gex snip --dry-run
+# Snip Operation Summary:
+#   Current branch:    feature/auth
+#   Target branch:     main
+#   Commit to snip:    abc1234
+#   Commit message:    Add user authentication
+#   Author:            John Doe <john@example.com>
+#   Date:              2024-01-15
+#   
+# Would execute:
+#   1. git checkout main
+#   2. git pull --ff-only origin main
+#   3. git cherry-pick abc1234
+#   4. git branch -f feature/auth HEAD
+#   5. git checkout feature/auth
+```
+
+### Conflict Resolution
+
+If cherry-pick fails:
+```bash
+gex snip
+# ERROR: Cherry-pick failed with conflicts!
+# 
+# To resolve:
+#   1. Fix conflicts in the listed files
+#   2. git add <resolved-files>
+#   3. git cherry-pick --continue
+#   4. gex snip --onto=main --commit=abc1234  # Re-run to complete
+# 
+# To abort:
+#   git cherry-pick --abort
+#   git checkout feature/auth
+```
+
+---
+
+## wip
+
+**Create and manage work-in-progress commits with easy rollback.**
+
+The `wip` command enables quick checkpointing of work with simple undo functionality, perfect for experimental changes or break points.
+
+### Syntax
+```bash
+gex wip [message] [options]
+```
+
+### Key Features
+- **Quick checkpointing**: Instant commits with WIP prefix
+- **Easy rollback**: Undo last WIP commit perfectly
+- **WIP history**: List recent WIP commits
+- **Hook skipping**: Bypass pre-commit hooks for speed
+- **Safe operations**: Only affects WIP commits
+
+### Options
+
+| Option | Description | Example |
+|--------|-------------|---------|
+| `--undo` | Rollback last WIP commit | `--undo` |
+| `--list` | Show recent WIP commits | `--list` |
+| `--push` | Push WIP (skip hooks) | `--push` |
+
+### Examples
+
+```bash
+# Quick WIP commit
+gex wip "checkpoint before refactor"
+# Creates: "WIP: checkpoint before refactor"
+
+# WIP without message
+gex wip
+# Creates: "WIP: [timestamp]"
+
+# Undo last WIP
+gex wip --undo
+# Perfectly restores previous state
+
+# List recent WIP commits
+gex wip --list
+# Shows: WIP commits with rollback info
+
+# Push WIP commit (bypass hooks)
+gex wip "broken but need to switch machines" --push
+```
+
+### WIP Commit Format
+
+```bash
+gex wip "testing new algorithm"
+# Commit message: "WIP: testing new algorithm"
+# 
+# Includes metadata for safe undo:
+# - Previous HEAD position
+# - Working directory state
+# - Staging area contents
+```
+
+### Safe Undo
+
+```bash
+gex wip --undo
+# INFO: Rolling back WIP commit abc1234
+# INFO: Restored to previous state def5678
+# INFO: Working directory and staging area restored
+```
+
+**Undo Limitations:**
+- Only works on WIP commits (prefixed with "WIP:")
+- Must be the most recent commit
+- Preserves uncommitted changes when possible
+
+---
+
+## config
+
+**Manage gex configuration and workflow presets.**
+
+The `config` command handles global and repository-specific settings, workflow presets, and customization options.
+
+### Syntax
+```bash
+gex config <action> [arguments]
+```
+
+### Actions
+
+| Action | Description | Example |
+|--------|-------------|---------|
+| `set <key> <value>` | Set configuration value | `set branch_types "epic,story,task"` |
+| `get <key>` | Get configuration value | `get default_remote` |
+| `use <preset>` | Apply workflow preset | `use features` |
+| `list` | Show current configuration | `list` |
+| `presets` | List available presets | `presets` |
+
+### Examples
+
+```bash
+# Set custom branch types
+gex config set branch_types "epic,story,task,bugfix"
+
+# Set default base branch
+gex config set default_base_branch develop
+
+# Get current remote setting
+gex config get default_remote
+
+# Apply a workflow preset
+gex config use features
+
+# Show all configuration
+gex config list
+
+# See available presets
+gex config presets
+```
+
+### Workflow Presets
+
+**`features` preset:**
+```bash
+gex config use features
+# Sets:
+#   branch_types = feature,bugfix,hotfix,chore,docs
+#   default_base_branch = main
+```
+
+**`patches` preset:**
+```bash
+gex config use patches
+# Sets:
+#   branch_types = features,patches,hotfix
+#   default_base_branch = develop
+```
 
 ---
 
 ## Configuration
 
-Configuration files:
-- Global: `~/.config/gex/config`
-- Per repo: `.gexrc` at repo root
+### Configuration Files
 
-Common settings:
+**Global configuration:** `~/.config/gex/config`
+```ini
+# Global gex configuration
+default_remote = origin
+auto_set_upstream = true
+protected_branches = main,master,develop,release/*
+```
 
-    # Branch types for gex start
-    branch_types = feature,bugfix,hotfix,chore,docs
-    
-    # Default base branch
-    default_base_branch = main
-    
-    # Default remote for publishing
-    default_remote = origin
-    
-    # Protected branches (warnings on force push)
-    protected_branches = main,master,develop,release/*
-    
-    # Auto-set upstream when publishing
-    auto_set_upstream = true
+**Repository configuration:** `.gexrc` (in repo root)
+```ini
+# Repository-specific overrides
+branch_types = epic,story,task,bugfix
+default_base_branch = develop
+auto_sync = false
+```
 
-Workflow presets:
-- `features`: Uses feature/bugfix/hotfix/chore branch types
-- `patches`: Uses features/patches/hotfix branch types
+### Configuration Keys
+
+| Key | Description | Default | Example |
+|-----|-------------|---------|---------|
+| `branch_types` | Available branch types for `start` | `feature,bugfix,hotfix,chore,docs` | `epic,story,task` |
+| `default_base_branch` | Default base for new branches | Auto-detect | `main`, `develop` |
+| `default_remote` | Default remote for publishing | `origin` | `upstream`, `fork` |
+| `auto_set_upstream` | Set upstream on publish | `true` | `false` |
+| `auto_sync` | Sync base branch before operations | `true` | `false` |
+| `protected_branches` | Branches to warn before force push | `main,master,develop` | `main,release/*` |
+
+### Environment Variables
+
+Override configuration with environment variables:
+
+```bash
+# Disable colors
+export NO_COLOR=1
+
+# Enable debug logging
+export GEX_DEBUG=1
+
+# Enable shell tracing
+export GEX_TRACE=1
+
+# Override config values
+export GEX_DEFAULT_REMOTE=upstream
+export GEX_BRANCH_TYPES=epic,story,task
+```
 
 ---
 
-## Contributing
+## Workflows
 
-Until contribution guidelines are formalized:
-1. Open an issue describing desired enhancement or bug.
-2. For code contributions:
-   - Keep scripts POSIX-friendly where practical (Bash features allowed but avoid unnecessary bashisms).
-   - Run shellcheck.
-   - Add or update tests (Bats) for non-trivial changes.
-3. Submit a pull request referencing the issue.
+### Feature Development Workflow
+
+```bash
+# 1. Start feature branch
+gex start feature user-authentication
+
+# 2. Develop and commit
+git add .
+git commit -m "Add login form"
+git commit -m "Add authentication logic"
+
+# 3. Checkpoint before risky changes
+gex wip "before refactoring auth flow"
+
+# 4. Continue development...
+# Something went wrong? Quick rollback:
+gex wip --undo
+
+# 5. Publish feature
+gex publish
+
+# 6. Main moved forward? Avoid rebase conflicts:
+gex snip --onto=main
+
+# 7. Visualize your work
+gex graph --branches "feature/*,main" --highlight main
+```
+
+### Hotfix Workflow
+
+```bash
+# 1. Create hotfix from production branch
+gex start hotfix security-fix --from=main
+
+# 2. Make critical fix
+git add .
+git commit -m "Fix security vulnerability"
+
+# 3. Publish hotfix
+gex publish
+
+# 4. Cherry-pick to develop
+gex snip --onto=develop --keep-original
+```
+
+### Team Collaboration Workflow
+
+```bash
+# 1. Configure team standards
+gex config set branch_types "epic,story,task,bugfix"
+gex config set protected_branches "main,develop,release/*"
+
+# 2. Start work on story
+gex start story user-dashboard --issue=123
+
+# 3. Create checkpoint before team sync
+gex wip "before standup demo"
+
+# 4. Publish for review
+gex publish --to=origin/story/123-user-dashboard
+
+# 5. Visualize team progress
+gex graph --since "1 week ago" --interactive
+```
 
 ---
 
-## Testing
+## Advanced Usage
 
-Tests will use [Bats](https://github.com/bats-core/bats-core).
+### Integration with fzf
 
-Run all tests (once they are added):
+Enable interactive branch selection:
+```bash
+# Install fzf first
+brew install fzf  # macOS
+apt install fzf    # Ubuntu
 
-    bats tests
+# Use interactive mode
+gex graph --interactive
+```
 
-Ensure `bats` is installed via your package manager or from source.
+### Custom Aliases
 
----
+Add to your `.bashrc` or `.zshrc`:
+```bash
+alias gg='gex graph --interactive'
+alias gs='gex start'
+alias gp='gex publish'
+alias gw='gex wip'
+alias gwu='gex wip --undo'
+```
 
-## Philosophy
+### CI/CD Integration
 
-- Leverage native `git` when possible before re-implementing logic.
-- Provide ergonomic defaults while exposing underlying power.
-- Favor transparency and explicit output over “magic.”
-- Design for incremental adoption—each command should stand alone.
+```bash
+# Disable color output in CI
+gex graph --no-color > git-history.txt
+
+# Check if branch follows naming convention
+if gex start --list-types | grep -q "^${BRANCH_PREFIX}$"; then
+  echo "Valid branch type: $BRANCH_PREFIX"
+else
+  echo "Invalid branch type: $BRANCH_PREFIX"
+  exit 1
+fi
+```
+
+### Scripting with gex
+
+```bash
+#!/bin/bash
+# Script to create and publish feature branch
+
+if [ $# -ne 1 ]; then
+  echo "Usage: $0 <feature-name>"
+  exit 1
+fi
+
+FEATURE_NAME="$1"
+
+# Create feature branch
+gex start feature "$FEATURE_NAME" --from=develop
+
+# Make initial commit
+touch "docs/${FEATURE_NAME}.md"
+git add "docs/${FEATURE_NAME}.md"
+git commit -m "Initial documentation for $FEATURE_NAME"
+
+# Publish for collaboration
+gex publish
+
+echo "Feature branch created and published: feature/$FEATURE_NAME"
+```
 
 ---
 
 ## Troubleshooting
 
-Symptom                | Possible Cause / Fix
------------------------|----------------------
-No graph output        | Branch patterns matched nothing; verify with `git branch --list`
-fzf error              | `fzf` not installed; remove `--interactive` or install it
-Unicode glyphs odd     | Terminal font lacks symbols; switch to `--style ascii`
-Colors off in CI       | CI non-TTY; use `--no-color` or set `NO_COLOR=1`
+### Common Issues
+
+**Command not found:**
+```bash
+gex: command not found
+```
+- Ensure gex is in your PATH
+- Check installation with `which gex`
+- Reload shell: `source ~/.bashrc`
+
+**Permission denied:**
+```bash
+permission denied: ./gex
+```
+- Make executable: `chmod +x gex commands/*`
+
+**Branch patterns match nothing:**
+```bash
+gex graph --branches "feature/*"
+# No output
+```
+- Check branches exist: `git branch --list "feature/*"`
+- Try: `gex graph --all` to see all branches
+
+**fzf not found:**
+```bash
+gex graph --interactive
+# ERROR: fzf not installed
+```
+- Install fzf: `brew install fzf` or `apt install fzf`
+- Or use without `--interactive`
+
+### Debug Mode
+
+Enable detailed logging:
+```bash
+export GEX_DEBUG=1
+gex graph --branches "feature/*"
+# DEBUG: Branch pattern: feature/*
+# DEBUG: Found branches: feature/auth, feature/ui
+# DEBUG: Executing: git log --graph --oneline...
+```
+
+Enable shell tracing:
+```bash
+export GEX_TRACE=1
+gex start feature test
+# Shows detailed shell execution
+```
+
+### Configuration Issues
+
+**Config not loading:**
+```bash
+gex config list
+# Shows default values only
+```
+- Check file exists: `ls ~/.config/gex/config`
+- Check repo config: `ls .gexrc`
+- Verify format: no spaces around `=`
+
+**Branch types not working:**
+```bash
+gex start epic new-feature
+# ERROR: Invalid branch type: epic
+```
+- Set branch types: `gex config set branch_types "epic,story,task"`
+- Or check current: `gex config get branch_types`
+
+---
+
+## Contributing
+
+We welcome contributions! Here's how to get started:
+
+### Development Setup
+
+```bash
+git clone https://github.com/dmoggles/gex.git
+cd gex
+chmod +x gex commands/*
+
+# Run tests
+./tests/test_*.sh
+
+# Check shell script quality
+shellcheck gex commands/*
+```
+
+### Guidelines
+
+1. **Compatibility**: Scripts should work on macOS and Linux
+2. **Safety**: Validate inputs, provide dry-run modes
+3. **Testing**: Add tests for new functionality
+4. **Documentation**: Update README and help text
+5. **Style**: Follow existing code patterns
+
+### Adding New Commands
+
+1. Create `commands/newcommand` (executable)
+2. Follow existing command structure:
+   - Usage function
+   - Argument parsing
+   - Validation
+   - Dry-run support
+   - Error handling
+3. Add tests in `tests/test_newcommand.sh`
+4. Update README documentation
+
+### Running Tests
+
+```bash
+# Run all tests
+for test in tests/test_*.sh; do
+  echo "Running $test"
+  "$test"
+done
+
+# Run specific test
+./tests/test_graph.sh
+```
 
 ---
 
 ## License
 
-Add a LICENSE file (e.g., MIT) to clarify usage rights.
+MIT License - see [LICENSE](LICENSE) file for details.
 
 ---
 
 ## Feedback
 
-Open issues for feature requests or problems. Early feedback strongly influences upcoming priorities.
+- **Issues**: [GitHub Issues](https://github.com/dmoggles/gex/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/dmoggles/gex/discussions)
+- **Email**: Open an issue for feature requests
 
-Enjoy quicker, clearer Git history exploration with `gex graph`!
+---
+
+**gex** - Making Git workflows safer, faster, and more intuitive.
