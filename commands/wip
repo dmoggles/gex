@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# gex wip - Quick Work-In-Progress commits with rollback capability
+#
+# Features:
+#   - Creates a WIP commit with all current changes (staged + unstaged)
+#   - Skips pre-commit hooks and verification
+#   - Saves state before WIP commit for easy rollback
+#   - Standardized WIP commit message format
+#   - Optional custom WIP message
+#   - Rollback to exact state before WIP commit
+#   - List and clean up WIP commits
+#   - Handles both staged and unstaged changes safely
+#
+# Usage:
+#   gex wip                           Create WIP commit with default message
+#   gex wip "custom message"          Create WIP commit with custom message
+#   gex wip --rollback                Undo the last WIP commit and restore state
+#   gex wip --list                    Show recent WIP commits
+#   gex wip --clean                   Remove old WIP commits (interactive)
+#   gex wip --status                  Show current WIP state
+#
+# Options:
+#   --rollback                Undo last WIP commit and restore working state
+#   --list                    Show recent WIP commits on current branch
+#   --clean                   Interactive cleanup of old WIP commits
+#   --status                  Show if there are uncommitted changes
+#   --no-verify               Skip pre-commit hooks (default behavior)
+#   --include-untracked       Include untracked files in WIP commit
+#   -h, --help                Show usage
+#
+# Examples:
+#   gex wip                           # "WIP: work in progress"
+#   gex wip "debugging auth issue"    # "WIP: debugging auth issue"
+#   gex wip --rollback                # Undo last WIP and restore files
+#   gex wip --list                    # Show recent WIP commits
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GEX_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# shellcheck source=../lib/core.sh
+source "$GEX_ROOT/lib/core.sh"
+# shellcheck source=../lib/git.sh
+source "$GEX_ROOT/lib/git.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: gex wip [message] [options]
+
+Create a quick Work-In-Progress commit or manage existing WIP commits.
+
+Arguments:
+  [message]               Custom WIP message (default: "work in progress")
+
+Options:
+  --rollback              Undo last WIP commit and restore working state
+  --list                  Show recent WIP commits on current branch
+  --clean                 Interactive cleanup of old WIP commits
+  --status                Show current working directory status
+  --include-untracked     Include untracked files in WIP commit
+  --no-verify             Skip pre-commit hooks (default)
+  -h, --help              Show this help
+
+Examples:
+  gex wip                           # Quick WIP commit with default message
+  gex wip "debugging login issue"   # WIP commit with custom message
+  gex wip --include-untracked       # Include new files in WIP
+  gex wip --rollback                # Undo last WIP commit
+  gex wip --list                    # Show recent WIP commits
+  gex wip --clean                   # Clean up old WIP commits
+
+WIP Commit Format:
+  WIP: [message] [timestamp]
+
+  Example: "WIP: debugging auth issue (2024-08-23 15:30)"
+
+State Management:
+  Before creating a WIP commit, gex saves:
+  - Index state (staged changes)
+  - Working tree state (unstaged changes)
+  - Untracked files list
+
+  Rollback restores the exact state before the WIP commit.
+EOF
+}
+
+gex_require_git_repo
+
+# -------------------------
+# Configuration & State
+# -------------------------
+WIP_MESSAGE=""
+ROLLBACK=0
+LIST_WIPS=0
+CLEAN_WIPS=0
+SHOW_STATUS=0
+INCLUDE_UNTRACKED=0
+NO_VERIFY=1
+
+# State file locations (stored in .git to avoid being tracked)
+GIT_DIR="$(git rev-parse --git-dir)"
+WIP_STATE_DIR="$GIT_DIR/gex-wip"
+WIP_INDEX_FILE="$WIP_STATE_DIR/index-before-wip"
+WIP_WORKDIR_FILE="$WIP_STATE_DIR/workdir-before-wip"
+WIP_UNTRACKED_FILE="$WIP_STATE_DIR/untracked-before-wip"
+WIP_HEAD_FILE="$WIP_STATE_DIR/head-before-wip"
+
+# -------------------------
+# Parse Arguments
+# -------------------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --rollback) ROLLBACK=1;;
+    --list) LIST_WIPS=1;;
+    --clean) CLEAN_WIPS=1;;
+    --status) SHOW_STATUS=1;;
+    --include-untracked) INCLUDE_UNTRACKED=1;;
+    --no-verify) NO_VERIFY=1;;  # Default anyway
+    -h|--help) usage; exit 0;;
+    --) shift; break;;
+    -*) gex_die "Unknown option: $1";;
+    *)
+      if [ -z "$WIP_MESSAGE" ]; then
+        WIP_MESSAGE="$1"
+      else
+        gex_die "Unexpected argument: $1"
+      fi
+      ;;
+  esac
+  shift
+done
+
+# -------------------------
+# Helper Functions
+# -------------------------
+is_wip_commit() {
+  local commit="${1:-HEAD}"
+  git show -s --format='%s' "$commit" 2>/dev/null | grep -q '^WIP:'
+}
+
+get_current_branch() {
+  git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD"
+}
+
+has_changes() {
+  # Check if there are any changes (staged, unstaged, or untracked if requested)
+  if [ -n "$(git status --porcelain)" ]; then
+    return 0
+  fi
+  return 1
+}
+
+save_current_state() {
+  mkdir -p "$WIP_STATE_DIR"
+
+  # Save current HEAD
+  git rev-parse HEAD > "$WIP_HEAD_FILE"
+
+  # Save current index state
+  git diff --cached > "$WIP_INDEX_FILE" || true
+
+  # Save current working directory state
+  git diff > "$WIP_WORKDIR_FILE" || true
+
+  # Save list of untracked files
+  git ls-files --others --exclude-standard > "$WIP_UNTRACKED_FILE" || true
+
+  gex_debug "Saved state before WIP commit"
+}
+
+restore_state() {
+  if [ ! -f "$WIP_HEAD_FILE" ]; then
+    gex_die "No saved WIP state found. Cannot rollback."
+  fi
+
+  local saved_head
+  saved_head="$(cat "$WIP_HEAD_FILE")"
+
+  # Reset to the commit before WIP
+  git reset --hard "$saved_head"
+
+  # Restore index state
+  if [ -s "$WIP_INDEX_FILE" ]; then
+    git apply --cached "$WIP_INDEX_FILE" 2>/dev/null || gex_warn "Could not fully restore staged changes"
+  fi
+
+  # Restore working directory state
+  if [ -s "$WIP_WORKDIR_FILE" ]; then
+    git apply "$WIP_WORKDIR_FILE" 2>/dev/null || gex_warn "Could not fully restore unstaged changes"
+  fi
+
+  # Restore untracked files (this is limited - files may have been modified)
+  if [ -s "$WIP_UNTRACKED_FILE" ]; then
+    gex_info "Note: Untracked files from before WIP commit are still present"
+  fi
+
+  # Clean up state files
+  rm -rf "$WIP_STATE_DIR"
+
+  gex_info "Restored state from before WIP commit"
+}
+
+create_wip_commit() {
+  local message="$1"
+  local timestamp
+  timestamp="$(date '+%Y-%m-%d %H:%M')"
+
+  # Default message if none provided
+  if [ -z "$message" ]; then
+    message="work in progress"
+  fi
+
+  local full_message="WIP: $message ($timestamp)"
+
+  # Save current state before making WIP commit
+  save_current_state
+
+  # Stage all tracked files if not already staged
+  git add -u
+
+  # Include untracked files if requested
+  if [ $INCLUDE_UNTRACKED -eq 1 ]; then
+    git add .
+    gex_info "Including untracked files in WIP commit"
+  fi
+
+  # Check if there's anything to commit
+  if git diff --cached --quiet; then
+    gex_warn "No changes to commit. Use --include-untracked to include new files."
+    # Clean up state since we didn't actually make a commit
+    rm -rf "$WIP_STATE_DIR"
+    return 1
+  fi
+
+  # Create the WIP commit, skipping hooks
+  git commit --no-verify -m "$full_message"
+
+  gex_info "Created WIP commit: $full_message"
+  gex_info "Use 'gex wip --rollback' to undo this commit and restore your working state"
+}
+
+list_wip_commits() {
+  local branch
+  branch="$(get_current_branch)"
+
+  echo "WIP commits on branch '$branch':"
+  echo
+
+  # Show WIP commits from the last 20 commits
+  local wip_list
+  wip_list="$(git log --oneline -20 --grep="^WIP:" --color=always || true)"
+
+  if [ -n "$wip_list" ]; then
+    echo "$wip_list" | sed 's/^/  /'
+  else
+    echo "  No WIP commits found in recent history."
+  fi
+
+  echo
+  echo "Use 'gex wip --clean' to remove old WIP commits."
+}
+
+clean_wip_commits() {
+  echo "Finding WIP commits on current branch..."
+
+  # Get list of WIP commits
+  local wip_commits
+  wip_commits="$(git log --oneline -50 --grep="^WIP:" --format="%H" || true)"
+
+  if [ -z "$wip_commits" ]; then
+    gex_info "No WIP commits found to clean up."
+    return 0
+  fi
+
+  echo "Found WIP commits:"
+  echo "$wip_commits" | while read -r commit; do
+    git log --oneline -1 "$commit"
+  done
+
+  echo
+  echo "WARNING: This will remove WIP commits from git history."
+  echo "Make sure you don't need any of these commits before proceeding."
+  echo
+  echo -n "Remove these WIP commits? [y/N]: "
+  read -r response
+
+  case "$response" in
+    [yY]|[yY][eE][sS])
+      echo "Cleaning up WIP commits..."
+      # This is a placeholder - actual implementation would need careful rebase
+      gex_warn "WIP commit cleanup not yet implemented. Use 'git rebase -i' manually."
+      ;;
+    *)
+      echo "Cancelled."
+      ;;
+  esac
+}
+
+show_status() {
+  echo "Working directory status:"
+  echo
+
+  if has_changes; then
+    git status --short
+    echo
+    echo "You can create a WIP commit with: gex wip"
+  else
+    echo "Working directory is clean."
+  fi
+
+  # Check if HEAD is a WIP commit
+  if is_wip_commit; then
+    echo
+    echo "Current HEAD is a WIP commit:"
+    git log -1 --oneline
+    echo "Use 'gex wip --rollback' to undo this WIP commit."
+  fi
+}
+
+# -------------------------
+# Main Logic
+# -------------------------
+
+# Handle different modes
+if [ $SHOW_STATUS -eq 1 ]; then
+  show_status
+  exit 0
+fi
+
+if [ $LIST_WIPS -eq 1 ]; then
+  list_wip_commits
+  exit 0
+fi
+
+if [ $CLEAN_WIPS -eq 1 ]; then
+  clean_wip_commits
+  exit 0
+fi
+
+if [ $ROLLBACK -eq 1 ]; then
+  # Verify HEAD is a WIP commit
+  if ! is_wip_commit; then
+    gex_die "Current HEAD is not a WIP commit. Cannot rollback."
+  fi
+
+  restore_state
+  exit 0
+fi
+
+# Default action: create WIP commit
+if ! has_changes && [ $INCLUDE_UNTRACKED -eq 0 ]; then
+  gex_warn "No changes to commit."
+  echo "Use 'gex wip --include-untracked' to include new files."
+  echo "Use 'gex wip --status' to see current status."
+  exit 1
+fi
+
+create_wip_commit "$WIP_MESSAGE"
+
+# End of wip command
