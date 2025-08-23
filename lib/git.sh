@@ -307,6 +307,11 @@ gex_git_branch_divergence() {
   echo "${ahead:-0} ${behind:-0}"
 }
 
+# Check if working directory is clean (no uncommitted changes)
+gex_git_is_clean() {
+  [ -z "$(git status --porcelain 2>/dev/null)" ]
+}
+
 # -----------------------------------------------------------------------------
 # Misc / formatting helpers
 # -----------------------------------------------------------------------------

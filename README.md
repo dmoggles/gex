@@ -4,7 +4,7 @@ A lightweight, extensible command-line tool that enhances Git workflows with int
 
 **gex** provides high-level commands that wrap common Git operations, making complex workflows simple and safe while preserving the full power of Git underneath.
 
-> **Status**: Production ready. Core commands: `graph`, `start`, `publish`, `snip`, `wip`, `config`
+> **Status**: Production ready. Core commands: `graph`, `start`, `publish`, `snip`, `squash`, `wip`, `config`
 
 ---
 
@@ -18,6 +18,7 @@ A lightweight, extensible command-line tool that enhances Git workflows with int
   - [start - Create branches with smart naming](#start)
   - [publish - Push branches safely](#publish)
   - [snip - Cherry-pick to avoid conflicts](#snip)
+  - [squash - Combine multiple commits](#squash)
   - [wip - Quick work-in-progress commits](#wip)
   - [config - Manage configuration](#config)
 - [Configuration](#configuration)
@@ -130,7 +131,25 @@ gex wip --undo
 gex wip --list
 ```
 
-### 3. Avoiding Rebase Conflicts
+### 3. Cleaning Up Commit History
+
+```bash
+# You made several small commits while developing
+git log --oneline -5
+# a1b2c3d Fix typo
+# e4f5g6h Add validation  
+# i7j8k9l Update tests
+# m0n1o2p Add feature
+# p3q4r5s Start work
+
+# Squash the last 4 commits into one clean commit
+gex squash --count=4 -m "Implement user validation feature"
+
+# Now you have clean history ready to publish
+gex publish --force-with-lease
+```
+
+### 4. Avoiding Rebase Conflicts
 
 ```bash
 # Your branch diverged from main with potential conflicts
@@ -491,6 +510,160 @@ gex snip
 # To abort:
 #   git cherry-pick --abort
 #   git checkout feature/auth
+```
+
+---
+
+## squash
+
+**Combine multiple commits into a single commit with smart defaults and safety checks.**
+
+The `squash` command provides a safe and flexible way to clean up commit history by combining multiple commits into one, with automatic detection of unpushed commits and comprehensive safety features.
+
+### Syntax
+```bash
+gex squash [options] [<commit-range>]
+```
+
+### Key Features
+- **Smart detection**: Auto-detects unpushed commits to avoid rewriting shared history
+- **Multiple modes**: Count-based, range-based, or interactive selection
+- **Safety first**: Requires clean working directory and warns about force-push implications
+- **Flexible messaging**: Custom commit messages or interactive editor
+- **Comprehensive preview**: Shows exactly what will be squashed before execution
+
+### The Problem Solved
+
+```
+Before:     feature-branch
+            |
+            A---B---C---D---E (5 small commits)
+
+After:      feature-branch
+            |
+            A---F (1 clean commit combining B,C,D,E)
+```
+
+### Options
+
+| Option | Description | Example |
+|--------|-------------|---------|
+| `--count=N`, `-n N` | Squash last N commits | `--count=3` |
+| `--message=MSG`, `-m MSG` | New commit message | `-m "Combined work"` |
+| `--interactive`, `-i` | Choose commits interactively | `--interactive` |
+| `--onto=COMMIT` | Squash onto specific commit | `--onto=main` |
+| `--force` | Allow squashing pushed commits | `--force` |
+| `--dry-run` | Preview operation | `--dry-run` |
+
+### Examples
+
+```bash
+# Squash all unpushed commits (default)
+gex squash
+
+# Squash last 3 commits
+gex squash --count=3
+
+# Squash with custom message
+gex squash -n 5 -m "Implement user authentication feature"
+
+# Squash specific range
+gex squash HEAD~3..HEAD
+
+# Interactive selection
+gex squash --interactive
+
+# Preview operation
+gex squash --dry-run --count=2
+```
+
+### Interactive Mode
+
+```bash
+gex squash --interactive
+# Select commits to squash (showing last 20 commits):
+# 
+# 0: a1b2c3d Fix typo in README
+# 1: e4f5g6h Add user validation
+# 2: i7j8k9l Update API documentation  
+# 3: m0n1o2p Refactor auth module
+# 4: p3q4r5s Initial user auth implementation
+# 
+# Enter commit numbers to squash (e.g., 0-2 or 0,1,2): 0-2
+```
+
+### Safety Features
+
+**Clean Working Directory:**
+```bash
+gex squash --count=3
+# ERROR: Working directory must be clean before squashing commits. 
+# Commit or stash your changes first.
+```
+
+**Pushed Commit Protection:**
+```bash
+gex squash --count=5
+# ERROR: Some commits in range have been pushed to upstream:
+#   a1b2c3d Fix user authentication bug
+#   e4f5g6h Update documentation
+# 
+# Squashing pushed commits will rewrite shared history!
+# This requires force-push and may affect other developers.
+# 
+# Use --force to proceed anyway (dangerous) or adjust your range.
+```
+
+**Detailed Preview:**
+```bash
+gex squash --dry-run --count=3
+# Squash Plan:
+#   Branch:         feature/auth
+#   Commit range:   HEAD~3..HEAD
+#   Commits:        3
+# 
+# Commits to squash:
+#   a1b2c3d Fix typo in validation
+#   e4f5g6h Add password strength check
+#   i7j8k9l Implement user registration
+# 
+# Target (squashing onto):
+#   m0n1o2p Initial auth framework
+# 
+# Commit message will be:
+#   Implement user registration (from first commit)
+# 
+# DRY RUN - Would execute:
+#   git reset --soft m0n1o2p
+#   git commit -m "Implement user registration"  # (from first commit)
+# 
+# This would squash 3 commits into 1 commit.
+```
+
+### Force-Push Integration
+
+After squashing, you'll typically need to force-push:
+
+```bash
+gex squash --count=3
+# Successfully squashed 3 commits!
+# 
+# Next steps:
+#   # Push the squashed commit:
+#   gex publish --force-with-lease
+```
+
+### Default Behavior
+
+When no custom message is provided with `--message`, the squash command automatically uses the commit message from the first (oldest) commit in the squash range. This preserves the original intent while cleaning up intermediate commits.
+
+### Configuration
+
+Set defaults in `~/.config/gex/config` or `.gexrc`:
+
+```ini
+squash_unpushed_only = true     # Only squash unpushed commits
+squash_preserve_merges = false  # Don't preserve merge commits
 ```
 
 ---

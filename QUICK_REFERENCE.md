@@ -9,13 +9,16 @@
 gex start <type> <name>           # Create branch with naming conventions
 gex publish                       # Push with upstream tracking & safety checks
 gex snip                          # Cherry-pick to avoid rebase conflicts
+gex squash --count=N              # Squash last N commits into one
 ```
 
-### Work-in-Progress
+### Commit Management
 ```bash
 gex wip "checkpoint"              # Quick WIP commit
 gex wip --undo                    # Rollback last WIP commit
 gex wip --list                    # Show WIP history
+gex squash                        # Squash unpushed commits
+gex squash --interactive          # Choose commits to squash
 ```
 
 ### Visualization
@@ -39,7 +42,8 @@ gex config list                   # Show current config
 gex start feature user-auth       # Create: feature/user-auth
 # ... develop ...
 gex wip "checkpoint"              # Quick save
-gex publish                       # Push with upstream
+gex squash --count=3              # Clean up commit history
+gex publish --force-with-lease    # Push with upstream
 gex snip --onto=main              # Avoid rebase conflicts
 ```
 
@@ -92,6 +96,16 @@ git reset --hard HEAD~1           # Undo last regular commit
 --author "email"        # Author filter
 --interactive           # fzf branch picker
 --highlight "branches"   # Emphasize: "main,develop"
+```
+
+### squash
+```bash
+--count=N, -n N          # Squash last N commits
+--message=MSG, -m MSG    # Custom commit message
+--interactive, -i        # Choose commits interactively
+--onto=COMMIT           # Squash onto specific commit
+--force                 # Allow squashing pushed commits
+--dry-run              # Preview operation
 ```
 
 ### wip

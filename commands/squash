@@ -1,0 +1,571 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# gex squash - Smart commit squashing with safety checks and flexible options
+#
+# Features:
+#   - Squash last N commits or all unpushed commits
+#   - Interactive mode for selecting specific commits
+#   - Range-based squashing with commit specifications
+#   - Custom commit message handling
+#   - Safety checks for pushed commits and clean working directory
+#   - Integration with gex workflow and upstream tracking
+#   - Dry run mode for previewing actions
+#   - Force mode for advanced scenarios
+#
+# Usage:
+#   gex squash [options] [<commit-range>]
+#   gex squash --count=3
+#   gex squash --interactive
+#   gex squash HEAD~5..HEAD~1
+#
+# Options:
+#   --count=N, -n N       Squash last N commits (default: auto-detect unpushed)
+#   --message=MSG, -m MSG New commit message for squashed commit
+#   --interactive, -i     Choose commits interactively
+#   --onto=COMMIT         Squash commits onto specific commit (advanced)
+#   --force               Allow squashing pushed commits (dangerous)
+#   --dry-run             Show what would be done without executing
+#   -h, --help            Show usage
+#
+# Examples:
+#   gex squash                           # Squash all unpushed commits
+#   gex squash --count=3                 # Squash last 3 commits
+#   gex squash -n 5 -m "Combined work"   # Squash 5 commits with message
+#   gex squash HEAD~3..HEAD              # Squash specific range
+#   gex squash --interactive             # Choose commits interactively
+#   gex squash --onto=main               # Squash unpushed commits onto main
+#   gex squash --dry-run                 # Preview what would happen
+#
+# Safety Features:
+#   - Prevents squashing pushed commits (use --force to override)
+#   - Requires clean working directory
+#   - Shows commit details before squashing
+#   - Validates commit ranges and existence
+#   - Warns about force-push implications
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GEX_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# shellcheck source=../lib/core.sh
+source "$GEX_ROOT/lib/core.sh"
+# shellcheck source=../lib/git.sh
+source "$GEX_ROOT/lib/git.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: gex squash [options] [<commit-range>]
+
+Squash multiple commits into a single commit with smart defaults and safety checks.
+
+Options:
+  --count=N, -n N       Squash last N commits (default: auto-detect unpushed)
+  --message=MSG, -m MSG New commit message for squashed commit
+  --interactive, -i     Choose commits interactively using git log
+  --onto=COMMIT         Squash commits onto specific commit (default: auto-detect)
+  --force               Allow squashing pushed commits (dangerous)
+  --dry-run             Show what would be done without executing
+  -h, --help            Show this help
+
+Arguments:
+  <commit-range>        Git commit range (e.g., HEAD~3..HEAD, abc123..def456)
+
+Examples:
+  gex squash                           # Squash all unpushed commits
+  gex squash --count=3                 # Squash last 3 commits
+  gex squash -n 5 -m "Combined work"   # Squash 5 commits with message
+  gex squash HEAD~3..HEAD              # Squash specific range
+  gex squash --interactive             # Choose commits interactively
+  gex squash --onto=main               # Squash unpushed commits onto main
+  gex squash --dry-run                 # Preview what would happen
+
+Interactive Mode:
+  When using --interactive, you'll see a list of recent commits and can
+  choose which ones to squash together. This is safer than specifying
+  counts or ranges manually.
+
+Safety Features:
+  - Automatically detects unpushed commits to avoid squashing shared history
+  - Requires clean working directory (no uncommitted changes)
+  - Shows detailed commit information before squashing
+  - Validates all commit references exist
+  - Warns when squashing will require force-push to remote
+
+Integration:
+  Works seamlessly with other gex commands:
+    gex start feature my-feature
+    # ... make several commits ...
+    gex squash --count=3              # Clean up commit history
+    gex publish                       # Push clean history
+
+Default Behavior:
+  When no --message is provided, uses the commit message from the first
+  (oldest) commit in the squash range. This preserves the original intent
+  while cleaning up the commit history.
+
+Configuration:
+  Set defaults in ~/.config/gex/config or .gexrc:
+    squash_unpushed_only = true       # Only squash unpushed commits
+    squash_preserve_merges = false    # Don't preserve merge commits
+EOF
+}
+
+# Require git repository
+gex_require_git_repo
+
+# -------------------------
+# Configuration & Defaults
+# -------------------------
+SQUASH_COUNT=""
+COMMIT_MESSAGE=""
+INTERACTIVE_MODE=0
+ONTO_COMMIT=""
+FORCE_SQUASH=0
+DRY_RUN=0
+COMMIT_RANGE=""
+SQUASH_UNPUSHED_ONLY=1
+PRESERVE_MERGES=0
+
+# Load configuration
+load_config() {
+  local unpushed_only
+  if command -v gex_config_get >/dev/null 2>&1; then
+    unpushed_only="$(gex_config_get squash_unpushed_only 2>/dev/null || echo "")"
+    if [ "${unpushed_only:-}" = "false" ]; then
+      SQUASH_UNPUSHED_ONLY=0
+    fi
+
+    local preserve_merges
+    preserve_merges="$(gex_config_get squash_preserve_merges 2>/dev/null || echo "")"
+    if [ "${preserve_merges:-}" = "true" ]; then
+      PRESERVE_MERGES=1
+    fi
+  fi
+}
+
+# -------------------------
+# Parse Arguments
+# -------------------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --count=*) SQUASH_COUNT="${1#--count=}";;
+    --count|-n) shift; SQUASH_COUNT="$1";;
+    --message=*) COMMIT_MESSAGE="${1#--message=}";;
+    --message|-m) shift; COMMIT_MESSAGE="$1";;
+    --interactive|-i) INTERACTIVE_MODE=1;;
+    --onto=*) ONTO_COMMIT="${1#--onto=}";;
+    --onto) shift; ONTO_COMMIT="$1";;
+    --force) FORCE_SQUASH=1;;
+    --dry-run) DRY_RUN=1;;
+    -h|--help) usage; exit 0;;
+    --) shift; break;;
+    -*) gex_die "Unknown option: $1";;
+    *)
+      if [ -z "$COMMIT_RANGE" ]; then
+        COMMIT_RANGE="$1"
+      else
+        gex_die "Multiple commit ranges specified: '$COMMIT_RANGE' and '$1'"
+      fi
+      ;;
+  esac
+  shift
+done
+
+# Load config after parsing arguments
+load_config
+
+# -------------------------
+# Validation & Setup
+# -------------------------
+
+# Check if we're in detached HEAD
+if gex_git_is_detached; then
+  gex_die "Cannot squash commits from detached HEAD state. Check out a branch first."
+fi
+
+# Require clean working directory
+if ! gex_git_is_clean; then
+  gex_die "Working directory must be clean before squashing commits. Commit or stash your changes first."
+fi
+
+# Get current branch
+CURRENT_BRANCH="$(gex_git_current_branch)"
+[ -n "$CURRENT_BRANCH" ] || gex_die "Could not determine current branch"
+
+gex_debug "Current branch: $CURRENT_BRANCH"
+
+# -------------------------
+# Helper Functions
+# -------------------------
+
+# Get upstream branch for comparison
+get_upstream_branch() {
+  local upstream
+  upstream="$(git rev-parse --abbrev-ref "${CURRENT_BRANCH}@{upstream}" 2>/dev/null || echo "")"
+  if [ -n "$upstream" ]; then
+    echo "$upstream"
+    return 0
+  fi
+
+  # Try common upstream patterns
+  for remote in origin upstream; do
+    if git rev-parse --verify "$remote/$CURRENT_BRANCH" >/dev/null 2>&1; then
+      echo "$remote/$CURRENT_BRANCH"
+      return 0
+    fi
+  done
+
+  # Try main/master branches
+  for remote in origin upstream; do
+    for branch in main master develop; do
+      if git rev-parse --verify "$remote/$branch" >/dev/null 2>&1; then
+        echo "$remote/$branch"
+        return 0
+      fi
+    done
+  done
+
+  return 1
+}
+
+# Count unpushed commits
+count_unpushed_commits() {
+  local upstream
+  upstream="$(get_upstream_branch)" || return 1
+  git rev-list --count "$upstream..HEAD" 2>/dev/null || echo "0"
+}
+
+# Get list of commits in range
+get_commits_in_range() {
+  local range="$1"
+  git rev-list --reverse "$range" 2>/dev/null || return 1
+}
+
+# Interactive commit selection
+interactive_select_commits() {
+  local max_commits=20
+  gex_info "Select commits to squash (showing last $max_commits commits):"
+  echo
+
+  # Show recent commits with numbers
+  git log --oneline --max-count=$max_commits --color=always | nl -v0 -s': '
+  echo
+
+  echo -n "Enter commit numbers to squash (e.g., 0-2 or 0,1,2): "
+  read -r selection
+
+  # Parse selection
+  local commits=()
+  if [[ "$selection" =~ ^[0-9]+-[0-9]+$ ]]; then
+    # Range format: 0-2
+    local start="${selection%-*}"
+    local end="${selection#*-}"
+    for ((i=start; i<=end; i++)); do
+      commits+=("$i")
+    done
+  elif [[ "$selection" =~ ^[0-9,]+$ ]]; then
+    # Comma format: 0,1,2
+    local oldIFS="$IFS"
+    IFS=','
+    for num in $selection; do
+      commits+=("$num")
+    done
+    IFS="$oldIFS"
+  else
+    gex_die "Invalid selection format. Use ranges (0-2) or comma-separated (0,1,2)"
+  fi
+
+  # Validate and get commit hashes
+  local selected_commits=()
+  for num in "${commits[@]}"; do
+    local commit_hash
+    commit_hash="$(git log --format='%H' --max-count=$max_commits | sed -n "$((num+1))p")"
+    if [ -z "$commit_hash" ]; then
+      gex_die "Invalid commit number: $num"
+    fi
+    selected_commits+=("$commit_hash")
+  done
+
+  if [ ${#selected_commits[@]} -lt 2 ]; then
+    gex_die "Need at least 2 commits to squash"
+  fi
+
+  # Return range from oldest to newest
+  local oldest="${selected_commits[-1]}"
+  local newest="${selected_commits[0]}"
+  echo "${oldest}..${newest}"
+}
+
+# -------------------------
+# Determine Squash Range
+# -------------------------
+
+determine_squash_range() {
+  # Interactive mode
+  if [ $INTERACTIVE_MODE -eq 1 ]; then
+    COMMIT_RANGE="$(interactive_select_commits)"
+    return 0
+  fi
+
+  # Explicit range provided
+  if [ -n "$COMMIT_RANGE" ]; then
+    # Validate range
+    if ! git rev-list "$COMMIT_RANGE" >/dev/null 2>&1; then
+      gex_die "Invalid commit range: $COMMIT_RANGE"
+    fi
+    return 0
+  fi
+
+  # Count-based squashing
+  if [ -n "$SQUASH_COUNT" ]; then
+    if ! [[ "$SQUASH_COUNT" =~ ^[0-9]+$ ]] || [ "$SQUASH_COUNT" -lt 2 ]; then
+      gex_die "Count must be a number >= 2, got: $SQUASH_COUNT"
+    fi
+    COMMIT_RANGE="HEAD~${SQUASH_COUNT}..HEAD"
+    return 0
+  fi
+
+  # Auto-detect unpushed commits
+  if [ $SQUASH_UNPUSHED_ONLY -eq 1 ]; then
+    local upstream
+    upstream="$(get_upstream_branch)" || {
+      gex_warn "No upstream branch found. Use --count or specify a range."
+      gex_die "Cannot auto-detect unpushed commits"
+    }
+
+    local unpushed_count
+    unpushed_count="$(count_unpushed_commits)"
+    if [ "$unpushed_count" -lt 2 ]; then
+      gex_die "Need at least 2 unpushed commits to squash (found: $unpushed_count)"
+    fi
+
+    gex_info "Auto-detected $unpushed_count unpushed commits"
+    COMMIT_RANGE="${upstream}..HEAD"
+    return 0
+  fi
+
+  # Default: last 2 commits
+  gex_warn "No range specified, defaulting to last 2 commits"
+  COMMIT_RANGE="HEAD~2..HEAD"
+}
+
+# -------------------------
+# Safety Checks
+# -------------------------
+
+check_pushed_commits() {
+  [ $FORCE_SQUASH -eq 1 ] && return 0
+
+  local upstream
+  upstream="$(get_upstream_branch)" || return 0  # No upstream, can't check
+
+  # Check if any commits in range are pushed
+  local commits
+  commits="$(get_commits_in_range "$COMMIT_RANGE")" || return 1
+
+  local pushed_commits=()
+  while IFS= read -r commit; do
+    if gex_git_is_ancestor "$commit" "$upstream"; then
+      pushed_commits+=("$commit")
+    fi
+  done <<<"$commits"
+
+  if [ ${#pushed_commits[@]} -gt 0 ]; then
+    gex_error "Some commits in range have been pushed to upstream:"
+    for commit in "${pushed_commits[@]}"; do
+      git log --oneline -1 "$commit" | sed 's/^/  /'
+    done
+    echo
+    gex_error "Squashing pushed commits will rewrite shared history!"
+    gex_error "This requires force-push and may affect other developers."
+    echo
+    echo "Use --force to proceed anyway (dangerous) or adjust your range."
+    return 1
+  fi
+
+  return 0
+}
+
+# -------------------------
+# Display Information
+# -------------------------
+
+show_squash_plan() {
+  echo "Squash Plan:"
+  echo "  Branch:         $CURRENT_BRANCH"
+  echo "  Commit range:   $COMMIT_RANGE"
+
+  # Count commits
+  local commit_count
+  commit_count="$(git rev-list --count "$COMMIT_RANGE" 2>/dev/null || echo "0")"
+  echo "  Commits:        $commit_count"
+
+  # Show commits to be squashed
+  echo
+  echo "Commits to squash:"
+  git log --oneline --reverse "$COMMIT_RANGE" | sed 's/^/  /'
+
+  # Show target commit (what we're squashing onto)
+  local target_commit
+  if [ -n "$ONTO_COMMIT" ]; then
+    target_commit="$ONTO_COMMIT"
+  else
+    target_commit="$(git rev-parse "${COMMIT_RANGE%%..*}" 2>/dev/null || echo "HEAD~$commit_count")"
+  fi
+
+  echo
+  echo "Target (squashing onto):"
+  git log --oneline -1 "$target_commit" | sed 's/^/  /'
+
+  # Show resulting message preview
+  if [ -n "$COMMIT_MESSAGE" ]; then
+    echo
+    echo "New commit message:"
+    echo "  $COMMIT_MESSAGE"
+  else
+    echo
+    echo "Commit message will be:"
+    first_commit="$(git rev-list "$COMMIT_RANGE" | tail -1)"
+    first_message="$(git log --format="%s" -1 "$first_commit")"
+    echo "  $first_message (from first commit)"
+  fi
+
+  echo
+}
+
+# -------------------------
+# Execute Squash
+# -------------------------
+
+perform_squash() {
+  local target_commit
+  if [ -n "$ONTO_COMMIT" ]; then
+    target_commit="$ONTO_COMMIT"
+  else
+    target_commit="$(git rev-parse "${COMMIT_RANGE%%..*}" 2>/dev/null)"
+  fi
+
+  # Capture first commit message BEFORE resetting
+  if [ -z "$COMMIT_MESSAGE" ]; then
+    first_commit="$(git rev-list "$COMMIT_RANGE" | tail -1)"
+    first_message="$(git log --format="%s" -1 "$first_commit")"
+    first_body="$(git log --format="%b" -1 "$first_commit")"
+  fi
+
+  # Create squash commit
+  git reset --soft "$target_commit"
+
+  if [ -n "$COMMIT_MESSAGE" ]; then
+    # Use provided message
+    git commit -m "$COMMIT_MESSAGE"
+  else
+    # Use first (oldest) commit's message as default
+    # Combine subject and body if body exists
+    if [ -n "$first_body" ]; then
+      git commit -m "$first_message" -m "$first_body"
+    else
+      git commit -m "$first_message"
+    fi
+  fi
+}
+
+# -------------------------
+# Main Logic
+# -------------------------
+
+# Determine what to squash
+determine_squash_range
+
+# Validate range
+if ! git rev-list "$COMMIT_RANGE" >/dev/null 2>&1; then
+  gex_die "Invalid commit range: $COMMIT_RANGE"
+fi
+
+# Check if range has commits
+commit_count="$(git rev-list --count "$COMMIT_RANGE" 2>/dev/null || echo "0")"
+if [ "$commit_count" -lt 2 ]; then
+  gex_die "Need at least 2 commits to squash (found: $commit_count in range $COMMIT_RANGE)"
+fi
+
+# Safety checks
+if ! check_pushed_commits; then
+  exit 1
+fi
+
+# Show plan
+show_squash_plan
+
+# Check for force-push implications
+if [ $DRY_RUN -eq 0 ] && [ $FORCE_SQUASH -eq 0 ]; then
+  upstream="$(get_upstream_branch)" || upstream=""
+  if [ -n "$upstream" ]; then
+    unpushed_count="$(count_unpushed_commits)"
+    if [ "$unpushed_count" -gt 0 ]; then
+      gex_warn "After squashing, you'll need to force-push to update the remote branch."
+      gex_warn "This rewrites commit history and may affect other developers."
+    fi
+  fi
+fi
+
+if [ $DRY_RUN -eq 1 ]; then
+  echo
+  echo "DRY RUN - Would execute:"
+  echo "  git reset --soft $(git rev-parse "${COMMIT_RANGE%%..*}")"
+  if [ -n "$COMMIT_MESSAGE" ]; then
+    echo "  git commit -m \"$COMMIT_MESSAGE\""
+  else
+    first_commit="$(git rev-list "$COMMIT_RANGE" | tail -1)"
+    first_message="$(git log --format="%s" -1 "$first_commit")"
+    echo "  git commit -m \"$first_message\"  # (from first commit)"
+  fi
+  echo
+  echo "This would squash $commit_count commits into 1 commit."
+  exit 0
+fi
+
+# Confirm with user
+if [ $INTERACTIVE_MODE -eq 0 ]; then
+  echo
+  echo -n "Proceed with squashing $commit_count commits? [y/N] "
+  read -r confirm
+  case "$confirm" in
+    [yY]|[yY][eE][sS]) ;;
+    *) gex_die "Aborted by user";;
+  esac
+fi
+
+# Execute squash
+gex_info "Squashing $commit_count commits..."
+
+if perform_squash; then
+  echo
+  gex_info "Successfully squashed $commit_count commits!"
+
+  # Show result
+  echo
+  echo "Result:"
+  git log --oneline -1 | sed 's/^/  /'
+
+  # Show next steps
+  echo
+  echo "Next steps:"
+  upstream="$(get_upstream_branch)" || upstream=""
+  if [ -n "$upstream" ]; then
+    echo "  # Push the squashed commit:"
+    echo "  gex publish --force-with-lease"
+  else
+    echo "  # Push the squashed commit:"
+    echo "  gex publish"
+  fi
+  echo
+  echo "  # Or continue working:"
+  echo "  git add . && git commit -m \"additional changes\""
+
+else
+  gex_error "Failed to squash commits"
+  exit 1
+fi
+
+# End of squash command

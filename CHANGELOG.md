@@ -5,6 +5,21 @@ All notable changes to the gex (Git eXtended) project are documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`gex squash`** - Smart commit squashing with safety checks
+  - Count-based squashing (`--count=N`)
+  - Range-based squashing (`HEAD~3..HEAD`)
+  - Interactive commit selection (`--interactive`)
+  - Auto-detection of unpushed commits
+  - Custom commit messages (`--message`)
+  - Intelligent defaults: uses first commit's message when no custom message provided
+  - Comprehensive safety checks (clean working directory, pushed commit protection)
+  - Dry-run mode (`--dry-run`)
+  - Force-push integration warnings
+  - Configuration support for default behavior
+
 ## [1.0.0] - 2024-08-24
 
 ### Major Release - Production Ready

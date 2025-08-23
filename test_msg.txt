@@ -1,0 +1,1 @@
+# Test squash with count
