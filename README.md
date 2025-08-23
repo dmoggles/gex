@@ -1,9 +1,9 @@
 # gex (Git eXtended)
 
 A lightweight, extensible command‑line tool that layers higher-level workflows on top of Git.
-The initial focus is on a powerful `graph` command for quickly visualizing commit history across multiple branches with flexible filtering, highlighting, and interactive selection.
+The initial focus is on a powerful `graph` command for quickly visualizing commit history across multiple branches with flexible filtering, highlighting, and interactive selection, plus essential workflow commands like `start`, `publish`, and `wip`.
 
-> Status: Early scaffold (MVP). Currently only the `graph` command is implemented.
+> Status: Core functionality implemented. Commands available: `graph`, `start`, `publish`, `wip`, `config`.
 
 ---
 
@@ -11,17 +11,21 @@ The initial focus is on a powerful `graph` command for quickly visualizing commi
 
 While `git` already provides rich plumbing, day‑to‑day workflows often repeat patterns:
 - Viewing a meaningful multi-branch commit graph
+- Creating branches with consistent naming conventions
+- Publishing branches with proper upstream tracking
+- Making quick work-in-progress commits
 - Focusing on a subset of branches (e.g., feature branches related to an epic)
 - Highlighting important branches (like `main`, `release/*`)
 - Quickly limiting output by author, date, merges, etc.
 - Interactively selecting branches with fuzzy search
 
-`gex graph` wraps and augments `git log --graph`, making those tasks faster and more discoverable while leaving room to evolve into a fully custom renderer later.
+`gex` provides commands that wrap and augment common git operations, making workflows faster and more discoverable.
 
 ---
 
 ## Features (Current)
 
+### Graph Command
 - Branch pattern selection: `--branches "feature/*,hotfix/*"`
 - Exclusions by glob: `--exclude "wip/*"`
 - Include remotes (`--remotes`) or everything (`--all`)
@@ -34,23 +38,41 @@ While `git` already provides rich plumbing, day‑to‑day workflows often repea
 - ASCII or basic Unicode graph lines: `--style ascii|unicode`
 - Decoration control: `--decorate short|full|no`
 - Disable color with `--no-color`
-- Safe behavior when HEAD is detached (ensures it’s shown)
+- Safe behavior when HEAD is detached (ensures it's shown)
 - Clean failure messages if patterns match nothing
+
+### Branch Management
+- **start**: Create branches with smart naming conventions (`gex start feature my-feature`)
+- **publish**: Push branches with upstream tracking and safety checks
+- **wip**: Quick work-in-progress commits with easy rollback
+
+### Configuration
+- Global and per-repository configuration support
+- Customizable branch types and naming patterns
+- Workflow presets for different project styles
 
 ---
 
 ## Planned (Short Term Roadmap)
 
+### Graph Enhancements
 - Dimming (faint color) of non-highlighted branches
 - JSON output mode for tooling (`--json`)
 - Rich Unicode graph with persistent branch color assignment
 - Intelligent subject line truncation (`--subject-width`)
-- Config file support (global + per-repo)
-- Additional commands: `start`, `sync`, `publish`, `prune`, etc.
+
+### Additional Commands
+- **sync**: Smart branch synchronization with remotes
+- **prune**: Clean up stale branches
+- **squash**: Interactive commit squashing
+
+### Integrations
+- Pull/merge request creation support
+- Issue tracker integration (GitHub, GitLab, Jira)
 
 Longer-term:
 - Plugin system for user-defined commands
-- Commit set diff utilities (e.g., “what’s on branch X but not Y?”)
+- Commit set diff utilities (e.g., "what's on branch X but not Y?")
 - Release & changelog automation
 
 ---
@@ -77,11 +99,113 @@ Fish:
 
 (Alternatively, symlink `gex` into a directory already on PATH.)
 
+### start
+
+Create branches with smart naming conventions and workflow automation.
+
+    gex start <type> <name> [options]
+
+Option               | Description
+--------------------|------------
+--from=<branch>     | Base branch (default: auto-detect main/develop)
+--issue=<number>    | Issue number to include in branch name
+--no-switch         | Create branch but don't check it out
+--no-sync           | Skip syncing base branch with remote
+--push              | Push new branch and set upstream tracking
+--interactive       | Interactive guided branch creation
+--list-types        | Show available branch types
+--dry-run           | Show what would be done without executing
+
+Examples:
+
+    gex start feature user-dashboard
+    gex start bugfix login-timeout --issue=456
+    gex start hotfix security-patch --from=release/v1.2 --push
+
+### publish
+
+Publish branches to remote repositories with safety checks and smart defaults.
+
+    gex publish [options]
+
+Option                  | Description
+-----------------------|------------
+--remote=<name>        | Remote to push to (default: origin)
+--branch=<name>        | Remote branch name (default: current branch)
+--to=<remote/branch>   | Shorthand for --remote=<remote> --branch=<branch>
+--force                | Force push (dangerous)
+--force-with-lease     | Force push with lease (safer)
+--no-set-upstream      | Don't set upstream tracking
+--dry-run              | Preview actions without executing
+
+Examples:
+
+    gex publish                              # Push current branch to origin
+    gex publish --remote=upstream            # Push to upstream remote
+    gex publish --to=origin/develop          # Push to origin/develop
+    gex publish --force-with-lease           # Safe force push
+
+### wip
+
+Create and manage work-in-progress commits with easy rollback.
+
+    gex wip [message] [options]
+
+Option     | Description
+-----------|------------
+--undo     | Rollback the last WIP commit
+--list     | List recent WIP commits
+--push     | Push WIP commit (skips pre-commit hooks)
+
+Examples:
+
+    gex wip "checkpoint before refactor"
+    gex wip --undo                          # Rollback last WIP
+    gex wip --list                          # Show WIP history
+
+### config
+
+Manage gex configuration and workflow presets.
+
+    gex config <action> [options]
+
+Actions:
+- `set <key> <value>` - Set configuration value
+- `get <key>` - Get configuration value
+- `use <preset>` - Apply workflow preset
+- `list` - Show current configuration
+- `presets` - List available presets
+
 ---
 
 ## Quick Start
 
-Inside any Git repository:
+### Basic Workflow
+
+Create a new feature branch:
+
+    gex start feature my-awesome-feature
+
+Make your changes and commit:
+
+    git add .
+    git commit -m "Add awesome feature"
+
+Publish your branch:
+
+    gex publish
+
+Quick work-in-progress commit:
+
+    gex wip "checkpoint before lunch"
+
+Rollback the WIP commit:
+
+    gex wip --undo
+
+### Graph Visualization
+
+View commit history:
 
     gex graph
 
@@ -117,9 +241,24 @@ No colors (useful for logs):
 
     gex graph --no-color
 
+### Configuration
+
+Set up workflow presets:
+
+    gex config use features    # Use feature/bugfix workflow
+    gex config use patches     # Use features/patches workflow
+
+Set custom branch types:
+
+    gex config set branch_types "epic,story,task,bugfix"
+
 ---
 
-## Command Reference: graph
+## Command Reference
+
+### graph
+
+Visualize commit history with flexible filtering and highlighting.
 
 Option (long)        | Description
 ---------------------|------------
@@ -147,13 +286,32 @@ Notes:
 
 ---
 
-## Configuration (Future)
+## Configuration
 
-Planned file locations:
+Configuration files:
 - Global: `~/.config/gex/config`
 - Per repo: `.gexrc` at repo root
 
-These will allow default branch patterns, highlighting sets, color preferences, etc.
+Common settings:
+
+    # Branch types for gex start
+    branch_types = feature,bugfix,hotfix,chore,docs
+    
+    # Default base branch
+    default_base_branch = main
+    
+    # Default remote for publishing
+    default_remote = origin
+    
+    # Protected branches (warnings on force push)
+    protected_branches = main,master,develop,release/*
+    
+    # Auto-set upstream when publishing
+    auto_set_upstream = true
+
+Workflow presets:
+- `features`: Uses feature/bugfix/hotfix/chore branch types
+- `patches`: Uses features/patches/hotfix branch types
 
 ---
 

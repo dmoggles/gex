@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# gex publish - Smart branch publishing with upstream tracking and safety checks
+#
+# Features:
+#   - Push current branch to remote with upstream tracking
+#   - Smart remote detection (origin, upstream, custom)
+#   - Safety checks for force pushes and branch protection
+#   - Support for publishing to different branch names on remote
+#   - Integration with gex branch naming conventions
+#   - Dry run mode for previewing actions
+#   - Status awareness (ahead/behind, conflicts, clean worktree)
+#
+# Usage:
+#   gex publish [options]
+#   gex publish --to=upstream/main
+#   gex publish --remote=fork --branch=my-feature
+#   gex publish --force --dry-run
+#
+# Options:
+#   --remote=<name>       Remote name (default: origin)
+#   --branch=<name>       Remote branch name (default: current branch)
+#   --to=<remote/branch>  Shorthand for --remote=<remote> --branch=<branch>
+#   --force               Force push (use with caution)
+#   --force-with-lease    Force push with lease (safer force push)
+#   --no-set-upstream     Don't set upstream tracking
+#   --dry-run             Show what would be done without executing
+#   --create-pr           Create pull/merge request after push (future)
+#   -h, --help            Show usage
+#
+# Examples:
+#   gex publish                              # Push current branch to origin
+#   gex publish --remote=upstream            # Push to upstream remote
+#   gex publish --branch=feature-branch      # Push as different name
+#   gex publish --to=origin/main             # Push current to origin/main
+#   gex publish --force-with-lease           # Safe force push
+#   gex publish --dry-run                    # Preview actions
+#
+# Safety Features:
+#   - Warns before force pushes
+#   - Checks for unpushed commits
+#   - Validates remote and branch existence
+#   - Prevents accidental pushes to protected branches
+#   - Shows divergence information before pushing
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GEX_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# shellcheck source=../lib/core.sh
+source "$GEX_ROOT/lib/core.sh"
+# shellcheck source=../lib/git.sh
+source "$GEX_ROOT/lib/git.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: gex publish [options]
+
+Publish the current branch to a remote repository with smart defaults and safety checks.
+
+Options:
+  --remote=<name>       Remote to push to (default: origin)
+  --branch=<name>       Remote branch name (default: current branch name)
+  --to=<remote/branch>  Shorthand: --remote=<remote> --branch=<branch>
+  --force               Force push (dangerous, use --force-with-lease instead)
+  --force-with-lease    Force push with lease (safer than --force)
+  --no-set-upstream     Don't set upstream tracking reference
+  --dry-run             Show what would be done without executing
+  -h, --help            Show this help
+
+Examples:
+  gex publish                              # Push current branch to origin
+  gex publish --remote=upstream            # Push to upstream remote
+  gex publish --branch=my-feature          # Push as different branch name
+  gex publish --to=origin/develop          # Push current branch to origin/develop
+  gex publish --force-with-lease           # Safe force push with lease
+  gex publish --dry-run                    # Preview what would happen
+
+Safety Features:
+  - Automatically sets upstream tracking for new branches
+  - Warns before destructive operations (force push)
+  - Shows branch status and divergence information
+  - Validates remote existence before pushing
+  - Prevents common mistakes like pushing to wrong remote
+
+Configuration:
+  Set defaults in ~/.config/gex/config or .gexrc in repo root:
+    default_remote = origin
+    auto_set_upstream = true
+    protected_branches = main,master,develop,release/*
+
+Integration:
+  Works seamlessly with branches created by 'gex start':
+    gex start feature my-awesome-feature
+    # ... make changes and commit ...
+    gex publish                             # Push feature/my-awesome-feature
+EOF
+}
+
+# Require git repository
+gex_require_git_repo
+
+# -------------------------
+# Configuration & Defaults
+# -------------------------
+DEFAULT_REMOTE="origin"
+AUTO_SET_UPSTREAM=1
+FORCE_PUSH=0
+FORCE_WITH_LEASE=0
+DRY_RUN=0
+REMOTE_NAME=""
+REMOTE_BRANCH=""
+PROTECTED_BRANCHES=("main" "master" "develop")
+
+# Load configuration
+load_config() {
+  local default_remote
+  default_remote="$(gex_config_get default_remote 2>/dev/null || echo "")"
+  [ -n "$default_remote" ] && DEFAULT_REMOTE="$default_remote"
+
+  local auto_upstream
+  auto_upstream="$(gex_config_get auto_set_upstream 2>/dev/null || echo "")"
+  [ "$auto_upstream" = "false" ] && AUTO_SET_UPSTREAM=0
+
+  local protected
+  protected="$(gex_config_get protected_branches 2>/dev/null || echo "")"
+  if [ -n "$protected" ]; then
+    PROTECTED_BRANCHES=()
+    local oldIFS="$IFS"
+    IFS=','
+    for branch in $protected; do
+      branch="$(echo "$branch" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+      [ -n "$branch" ] && PROTECTED_BRANCHES+=("$branch")
+    done
+    IFS="$oldIFS"
+  fi
+}
+
+# -------------------------
+# Parse Arguments
+# -------------------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --remote=*) REMOTE_NAME="${1#--remote=}";;
+    --remote) shift; REMOTE_NAME="$1";;
+    --branch=*) REMOTE_BRANCH="${1#--branch=}";;
+    --branch) shift; REMOTE_BRANCH="$1";;
+    --to=*)
+      to_value="${1#--to=}"
+      if [[ "$to_value" =~ ^([^/]+)/(.+)$ ]]; then
+        REMOTE_NAME="${BASH_REMATCH[1]}"
+        REMOTE_BRANCH="${BASH_REMATCH[2]}"
+      else
+        gex_die "Invalid --to format. Expected: remote/branch"
+      fi
+      ;;
+    --to)
+      shift
+      if [[ "$1" =~ ^([^/]+)/(.+)$ ]]; then
+        REMOTE_NAME="${BASH_REMATCH[1]}"
+        REMOTE_BRANCH="${BASH_REMATCH[2]}"
+      else
+        gex_die "Invalid --to format. Expected: remote/branch"
+      fi
+      ;;
+    --force) FORCE_PUSH=1;;
+    --force-with-lease) FORCE_WITH_LEASE=1;;
+    --no-set-upstream) AUTO_SET_UPSTREAM=0;;
+    --dry-run) DRY_RUN=1;;
+    -h|--help) usage; exit 0;;
+    --) shift; break;;
+    -*) gex_die "Unknown option: $1";;
+    *) gex_die "Unexpected argument: $1";;
+  esac
+  shift
+done
+
+# Load config after parsing arguments
+load_config
+
+# -------------------------
+# Validation & Setup
+# -------------------------
+
+# Check if we're in detached HEAD
+if gex_git_is_detached; then
+  gex_die "Cannot publish from detached HEAD state. Check out a branch first."
+fi
+
+# Get current branch
+CURRENT_BRANCH="$(gex_git_current_branch)"
+[ -n "$CURRENT_BRANCH" ] || gex_die "Could not determine current branch"
+
+# Set defaults
+REMOTE_NAME="${REMOTE_NAME:-$DEFAULT_REMOTE}"
+REMOTE_BRANCH="${REMOTE_BRANCH:-$CURRENT_BRANCH}"
+
+gex_debug "Current branch: $CURRENT_BRANCH"
+gex_debug "Target remote: $REMOTE_NAME"
+gex_debug "Target branch: $REMOTE_BRANCH"
+
+# Validate remote exists
+if ! git remote get-url "$REMOTE_NAME" >/dev/null 2>&1; then
+  gex_die "Remote '$REMOTE_NAME' does not exist. Available remotes: $(git remote | tr '\n' ' ')"
+fi
+
+# -------------------------
+# Safety Checks
+# -------------------------
+
+# Check for protected branches
+is_protected_branch() {
+  local branch="$1"
+  local pattern
+  for pattern in "${PROTECTED_BRANCHES[@]}"; do
+    if gex_match_glob "$branch" "$pattern"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+if is_protected_branch "$REMOTE_BRANCH"; then
+  if [ $FORCE_PUSH -eq 1 ] || [ $FORCE_WITH_LEASE -eq 1 ]; then
+    gex_warn "Target branch '$REMOTE_BRANCH' appears to be protected!"
+    if [ $DRY_RUN -eq 0 ]; then
+      echo -n "Are you sure you want to force push to a protected branch? [y/N] "
+      read -r confirm
+      case "$confirm" in
+        [yY]|[yY][eE][sS]) ;;
+        *) gex_die "Aborted by user";;
+      esac
+    fi
+  else
+    gex_warn "Target branch '$REMOTE_BRANCH' appears to be protected. Consider using a different branch name."
+  fi
+fi
+
+# Check if force push is needed
+needs_force_push() {
+  local remote_ref="$REMOTE_NAME/$REMOTE_BRANCH"
+
+  # If remote branch doesn't exist, no force needed
+  if ! git rev-parse --verify "$remote_ref" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  # Check if local branch is ahead of remote (normal case)
+  if gex_git_is_ancestor "$remote_ref" "$CURRENT_BRANCH"; then
+    return 1
+  fi
+
+  # Remote has commits not in local - force needed
+  return 0
+}
+
+# Auto-detect if force push is needed and warn user
+if [ $FORCE_PUSH -eq 0 ] && [ $FORCE_WITH_LEASE -eq 0 ] && needs_force_push; then
+  local remote_ref="$REMOTE_NAME/$REMOTE_BRANCH"
+  gex_warn "Remote branch '$remote_ref' has commits not in your local branch."
+  gex_warn "This requires a force push, which can be dangerous."
+  gex_info "Use --force-with-lease for a safer force push, or pull changes first."
+
+  if [ $DRY_RUN -eq 0 ]; then
+    echo -n "Force push with lease? [y/N] "
+    read -r confirm
+    case "$confirm" in
+      [yY]|[yY][eE][sS]) FORCE_WITH_LEASE=1;;
+      *) gex_die "Aborted. Pull changes first or use --force-with-lease";;
+    esac
+  else
+    gex_info "Would enable --force-with-lease automatically"
+    FORCE_WITH_LEASE=1
+  fi
+fi
+
+# Warn about force pushes
+if [ $FORCE_PUSH -eq 1 ] && [ $DRY_RUN -eq 0 ]; then
+  gex_warn "Force push can overwrite remote changes and affect other developers!"
+  gex_warn "Consider using --force-with-lease instead for better safety."
+  echo -n "Continue with force push? [y/N] "
+  read -r confirm
+  case "$confirm" in
+    [yY]|[yY][eE][sS]) ;;
+    *) gex_die "Aborted by user";;
+  esac
+fi
+
+# -------------------------
+# Status Information
+# -------------------------
+
+show_status() {
+  echo "Publishing Status:"
+  echo "  Local branch:   $CURRENT_BRANCH"
+  echo "  Remote:         $REMOTE_NAME"
+  echo "  Target branch:  $REMOTE_BRANCH"
+
+  # Show divergence if remote branch exists
+  local remote_ref="$REMOTE_NAME/$REMOTE_BRANCH"
+  if git rev-parse --verify "$remote_ref" >/dev/null 2>&1; then
+    local ahead behind
+    ahead=$(git rev-list --count "$remote_ref..$CURRENT_BRANCH" 2>/dev/null || echo "0")
+    behind=$(git rev-list --count "$CURRENT_BRANCH..$remote_ref" 2>/dev/null || echo "0")
+    echo "  Ahead:          $ahead commits"
+    echo "  Behind:         $behind commits"
+
+    if [ "$behind" -gt 0 ]; then
+      echo "  Status:         Force push required"
+    elif [ "$ahead" -gt 0 ]; then
+      echo "  Status:         Ready to push"
+    else
+      echo "  Status:         Up to date"
+    fi
+  else
+    echo "  Status:         New branch (will be created)"
+  fi
+
+  # Check upstream tracking
+  local upstream
+  upstream="$(git rev-parse --abbrev-ref "${CURRENT_BRANCH}@{upstream}" 2>/dev/null || echo "")"
+  if [ -n "$upstream" ]; then
+    echo "  Current upstream: $upstream"
+  else
+    echo "  Current upstream: (none)"
+  fi
+
+  if [ $AUTO_SET_UPSTREAM -eq 1 ]; then
+    echo "  Will set upstream: $REMOTE_NAME/$REMOTE_BRANCH"
+  fi
+
+  echo
+}
+
+# -------------------------
+# Build Git Command
+# -------------------------
+
+build_push_command() {
+  local cmd=("git" "push")
+
+  # Add force options
+  if [ $FORCE_WITH_LEASE -eq 1 ]; then
+    cmd+=("--force-with-lease")
+  elif [ $FORCE_PUSH -eq 1 ]; then
+    cmd+=("--force")
+  fi
+
+  # Add upstream tracking
+  if [ $AUTO_SET_UPSTREAM -eq 1 ]; then
+    cmd+=("--set-upstream")
+  fi
+
+  # Add remote and branch
+  cmd+=("$REMOTE_NAME" "$CURRENT_BRANCH:$REMOTE_BRANCH")
+
+  printf '%s\n' "${cmd[@]}"
+}
+
+# -------------------------
+# Execute
+# -------------------------
+
+show_status
+
+if [ $DRY_RUN -eq 1 ]; then
+  echo "DRY RUN - Would execute:"
+  build_push_command | sed 's/^/  /'
+  echo
+  echo "Additional actions:"
+  if [ $AUTO_SET_UPSTREAM -eq 1 ]; then
+    echo "  - Set upstream tracking to $REMOTE_NAME/$REMOTE_BRANCH"
+  fi
+  echo "  - Update remote refs"
+  exit 0
+fi
+
+# Execute the push
+gex_info "Publishing $CURRENT_BRANCH to $REMOTE_NAME/$REMOTE_BRANCH"
+
+push_cmd=($(build_push_command))
+if "${push_cmd[@]}"; then
+  echo
+  gex_info "Successfully published $CURRENT_BRANCH!"
+
+  # Show what was accomplished
+  if [ $AUTO_SET_UPSTREAM -eq 1 ]; then
+    gex_info "Upstream tracking set to $REMOTE_NAME/$REMOTE_BRANCH"
+  fi
+
+  # Show next steps
+  echo
+  echo "Next steps:"
+  echo "  # Continue working on your branch:"
+  echo "  git add . && git commit -m \"your changes\""
+  echo "  gex publish  # Push additional commits"
+  echo
+  echo "  # Or create a pull request:"
+  local repo_url
+  repo_url="$(git remote get-url "$REMOTE_NAME" 2>/dev/null || echo "")"
+  if [[ "$repo_url" =~ github\.com ]]; then
+    echo "  # GitHub: Create PR at the repository's GitHub page"
+  elif [[ "$repo_url" =~ gitlab\.com ]]; then
+    echo "  # GitLab: Create MR at the repository's GitLab page"
+  else
+    echo "  # Create a pull/merge request in your repository's web interface"
+  fi
+
+else
+  gex_error "Failed to publish branch"
+  echo
+  echo "Common causes:"
+  echo "  - Network connectivity issues"
+  echo "  - Authentication problems"
+  echo "  - Branch protection rules"
+  echo "  - Insufficient permissions"
+  echo
+  echo "Try:"
+  echo "  gex publish --dry-run  # Check what would be done"
+  echo "  git push --verbose $REMOTE_NAME $CURRENT_BRANCH:$REMOTE_BRANCH"
+  exit 1
+fi
+
+# End of publish command

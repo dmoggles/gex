@@ -96,6 +96,8 @@ $(list_internal_commands | sed "s/^/  /")
 Run 'gex <command> --help' for command-specific options.
 
 Examples:
+  gex start feature my-awesome-feature
+  gex publish                           # Push current branch
   gex graph
   gex graph --branches main,develop
   gex graph --interactive
@@ -113,7 +115,7 @@ EOF
 list_internal_commands() {
   if [ -d "$GEX_COMMAND_DIR" ]; then
     # List regular files that are executable or readable (allow user to chmod later)
-    find "$GEX_COMMAND_DIR" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort
+    find "$GEX_COMMAND_DIR" -maxdepth 1 -type f -exec basename {} \; 2>/dev/null | sort
   fi
 }
 
