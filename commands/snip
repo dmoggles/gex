@@ -137,8 +137,8 @@ load_config() {
     auto_sync="$(gex_config_get auto_sync 2>/dev/null || true)"
   fi
 
-  # Apply config values if they exist
-  if [ -n "$default_base" ] && [ "$default_base" != "" ]; then
+  # Apply config values only if not already set by command line arguments
+  if [ -z "$TARGET_BRANCH" ] && [ -n "$default_base" ] && [ "$default_base" != "" ]; then
     TARGET_BRANCH="$default_base"
   fi
 
