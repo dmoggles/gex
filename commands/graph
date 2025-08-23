@@ -147,12 +147,18 @@ collect_all_refs() {
   fi
 }
 
-mapfile -t ALL_REFS < <(collect_all_refs | sort)
+ALL_REFS=()
+while IFS= read -r __ref; do
+  ALL_REFS+=("$__ref")
+done < <(collect_all_refs | sort)
 
 # Interactive selection overrides patterns
 if [ $INTERACTIVE -eq 1 ]; then
   gex_have_cmd fzf || gex_die "fzf not installed; cannot use --interactive"
-  mapfile -t PICKED < <(printf "%s\n" "${ALL_REFS[@]}" | fzf -m --prompt="Select branches > ")
+  PICKED=()
+  while IFS= read -r __p; do
+    PICKED+=("$__p")
+  done < <(printf "%s\n" "${ALL_REFS[@]}" | fzf -m --prompt="Select branches > ")
   [ ${#PICKED[@]} -gt 0 ] || gex_die "No branches selected in interactive mode."
   BRANCH_PATTERNS=("${PICKED[@]}")
 fi
@@ -162,7 +168,10 @@ resolve_selected_branches() {
   local selected=()
   if [ ${#BRANCH_PATTERNS[@]} -eq 0 ] && [ $INCLUDE_ALL -eq 0 ]; then
     # Default: only local branches (avoid remotes unless requested)
-    mapfile -t selected < <(gex_git_local_branches)
+    selected=()
+    while IFS= read -r __l; do
+      selected+=("$__l")
+    done < <(gex_git_local_branches)
   else
     local ref p keep
     for ref in "${ALL_REFS[@]}"; do
@@ -191,7 +200,10 @@ resolve_selected_branches() {
   printf '%s\n' "${selected[@]}" | awk '!seen[$0]++'
 }
 
-mapfile -t SELECTED < <(resolve_selected_branches)
+SELECTED=()
+while IFS= read -r __s; do
+  SELECTED+=("$__s")
+done < <(resolve_selected_branches)
 
 [ ${#SELECTED[@]} -gt 0 ] || gex_die "No branches matched selection (patterns: ${BRANCH_PATTERNS[*]:-<none>})."
 
