@@ -15,6 +15,7 @@
 #   gex config list
 #   gex config init [--global|--local]
 #   gex config example <preset>
+#   gex config use <preset>
 #
 # Options:
 #   --global              Operate on global config (~/.config/gex/config)
@@ -27,6 +28,7 @@
 #   gex config get branch_types
 #   gex config init --local
 #   gex config example features-patches
+#   gex config use features-patches
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -48,6 +50,7 @@ Commands:
   list                     Show all configuration
   init [--global|--local]  Initialize config file with examples
   example <preset>         Show configuration examples
+  use <preset>             Apply preset configuration to current repo
   edit                     Open config file in editor
 
 Options:
@@ -62,6 +65,7 @@ Examples:
   gex config list
   gex config init --local
   gex config example features-patches
+  gex config use features-patches
 
 Configuration Keys:
   branch_types            Comma-separated list of allowed branch types
@@ -115,7 +119,8 @@ EOF
       echo "conventional (conv)   - Conventional commits style"
       echo "gitflow              - GitFlow workflow"
       echo
-      echo "Use: gex config example <preset>"
+      echo "Use: gex config example <preset> (to preview)"
+      echo "Use: gex config use <preset> (to apply)"
       ;;
   esac
 }
@@ -293,6 +298,45 @@ EOF
   echo "Common presets available with: gex config example <preset>"
 }
 
+config_use() {
+  local preset="$1"
+
+  # Validate preset
+  case "$preset" in
+    features-patches|fp|minimal|conventional|conv|gitflow) ;;
+    *)
+      gex_error "Unknown preset: $preset"
+      echo "Available presets: features-patches, minimal, conventional, gitflow" >&2
+      exit 2
+      ;;
+  esac
+
+  # Show what will be applied
+  echo "Applying preset '$preset' to: $CONFIG_FILE"
+  echo
+  show_examples "$preset"
+  echo
+
+  # Confirm if file exists
+  if [ -f "$CONFIG_FILE" ]; then
+    echo -n "This will overwrite existing configuration. Continue? [y/N]: "
+    read -r response
+    case "$response" in
+      [yY]|[yY][eE][sS]) ;;
+      *) echo "Cancelled."; exit 0;;
+    esac
+  fi
+
+  # Apply the preset
+  show_examples "$preset" > "$CONFIG_FILE"
+  gex_info "Applied preset '$preset' to $CONFIG_FILE"
+
+  # Show result
+  echo
+  echo "Current configuration:"
+  config_list
+}
+
 config_edit() {
   local editor="${EDITOR:-nano}"
   if [ ! -f "$CONFIG_FILE" ]; then
@@ -329,6 +373,10 @@ case "$COMMAND" in
   example)
     preset="${ARGS[0]:-all}"
     show_examples "$preset"
+    ;;
+  use)
+    [ ${#ARGS[@]} -eq 1 ] || gex_die "Usage: gex config use <preset>"
+    config_use "${ARGS[0]}"
     ;;
   edit)
     config_edit
