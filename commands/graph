@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# gex graph - display a visual commit graph with branch filtering & highlighting
+#
+# MVP features:
+#   --branches <list>       Comma-separated branch names or globs (feature/*)
+#   --exclude <list>        Comma-separated globs to exclude
+#   --remotes               Include remote branches
+#   --all                   Include all local + remote branches
+#   --since <rev|date>      Lower bound (rev or date like 2.weeks, 2024-01-01)
+#   --until <rev|date>      Upper bound (default: HEAD)
+#   --max <n>               Limit number of commits (uses --max-count)
+#   --author <pattern>      Author filter (passed to git log)
+#   --merges-only           Only merge commits
+#   --style ascii|unicode   Graph edge style (unicode = simple replacement)
+#   --no-color              Disable color output
+#   --highlight <list>      Branch names/globs whose decorations are emphasized
+#   --decorate <mode>       short|full|no (git decoration)
+#   --interactive           Select branches interactively with fzf
+#   --show-remote-labels    Keep remote refs even if local duplicate exists
+#   -h, --help              Usage
+#
+# Behavior notes:
+#   * If no explicit branch selection flags, defaults to local branches.
+#   * --all implies --remotes and ignores explicit --branches if none provided.
+#   * Highlighting currently colors decoration blocks containing the pattern.
+#   * Exclusions add negative rev arguments (^ref) as well as removing from selection.
+#
+# Future enhancements (planned):
+#   - Dim non-highlighted commits
+#   - JSON / structured output
+#   - Persistent branch color mapping
+#   - Advanced Unicode renderer (custom DAG traversal)
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GEX_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# shellcheck source=../lib/core.sh
+source "$GEX_ROOT/lib/core.sh"
+# shellcheck source=../lib/git.sh
+source "$GEX_ROOT/lib/git.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: gex graph [options]
+
+Options:
+  --branches <list>          Comma-separated branch names or glob patterns (e.g. "main,feature/*")
+  --exclude <list>           Comma-separated glob patterns to exclude
+  --remotes                  Include remote branches
+  --all                      Include all local + remote branches
+  --since <rev|date>         Lower bound (e.g. "2.weeks", "2024-01-01", tag, or commit)
+  --until <rev|date>         Upper bound (default: HEAD)
+  --max <n>                  Maximum number of commits (applied via --max-count)
+  --author <pattern>         Filter by author
+  --merges-only              Only merge commits
+  --style ascii|unicode      Graph style (default: ascii)
+  --no-color                 Disable color output
+  --highlight <list>         Comma-separated branches/globs to emphasize in decorations
+  --decorate <mode>          Decoration mode: short|full|no (default: short)
+  --interactive              Use fzf multi-select to pick branches
+  --show-remote-labels       Do not suppress remote refs that duplicate locals
+  -h, --help                 Show this help
+
+Examples:
+  gex graph
+  gex graph --branches main,develop
+  gex graph --branches 'feature/*' --highlight main --since 2.weeks --max 150
+  gex graph --all --merges-only
+  gex graph --interactive
+EOF
+}
+
+gex_require_git_repo
+
+# -------------------------
+# Option defaults
+# -------------------------
+INCLUDE_REMOTES=0
+INCLUDE_ALL=0
+BRANCH_PATTERNS=()
+EXCLUDE_PATTERNS=()
+SINCE=""
+UNTIL="HEAD"
+MAX=""
+AUTHOR=""
+MERGES_ONLY=0
+STYLE="ascii"
+NO_COLOR_FLAG=0
+HIGHLIGHT_PATTERNS=()
+DECORATE="short"
+INTERACTIVE=0
+SHOW_REMOTE_LABELS=0
+
+# -------------------------
+# Parse arguments
+# -------------------------
+parse_csv_into_array() {
+  local ref="$1"; shift
+  local raw="$1"
+  local -n _arr_ref="$ref"
+  IFS=',' read -r -a items <<<"$raw"
+  for it in "${items[@]}"; do
+    [ -n "$it" ] && _arr_ref+=("$it")
+  done
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --branches) shift; [ $# -gt 0 ] || gex_die "--branches requires a value"; parse_csv_into_array BRANCH_PATTERNS "$1";;
+    --exclude) shift; [ $# -gt 0 ] || gex_die "--exclude requires a value"; parse_csv_into_array EXCLUDE_PATTERNS "$1";;
+    --remotes) INCLUDE_REMOTES=1;;
+    --all) INCLUDE_ALL=1; INCLUDE_REMOTES=1;;
+    --since) shift; SINCE="$1";;
+    --until) shift; UNTIL="$1";;
+    --max) shift; MAX="$1";;
+    --author) shift; AUTHOR="$1";;
+    --merges-only) MERGES_ONLY=1;;
+    --style) shift; STYLE="$1";;
+    --no-color) NO_COLOR_FLAG=1; export NO_COLOR=1;;
+    --highlight) shift; [ $# -gt 0 ] || gex_die "--highlight requires value"; parse_csv_into_array HIGHLIGHT_PATTERNS "$1";;
+    --decorate) shift; DECORATE="$1";;
+    --interactive) INTERACTIVE=1;;
+    --show-remote-labels) SHOW_REMOTE_LABELS=1;;
+    -h|--help) usage; exit 0;;
+    --) shift; break;;
+    *) gex_die "Unknown option: $1";;
+  esac
+  shift
+done
+
+[[ "$STYLE" =~ ^(ascii|unicode)$ ]] || gex_die "Invalid --style: $STYLE"
+[[ "$DECORATE" =~ ^(short|full|no)$ ]] || gex_die "Invalid --decorate: $DECORATE"
+
+# -------------------------
+# Branch collection
+# -------------------------
+
+collect_all_refs() {
+  if [ $INCLUDE_REMOTES -eq 1 ]; then
+    { gex_git_local_branches; gex_git_remote_branches; } | awk '!seen[$0]++'
+  else
+    gex_git_local_branches
+  fi
+}
+
+mapfile -t ALL_REFS < <(collect_all_refs | sort)
+
+# Interactive selection overrides patterns
+if [ $INTERACTIVE -eq 1 ]; then
+  gex_have_cmd fzf || gex_die "fzf not installed; cannot use --interactive"
+  mapfile -t PICKED < <(printf "%s\n" "${ALL_REFS[@]}" | fzf -m --prompt="Select branches > ")
+  [ ${#PICKED[@]} -gt 0 ] || gex_die "No branches selected in interactive mode."
+  BRANCH_PATTERNS=("${PICKED[@]}")
+fi
+
+# Resolve branch selection
+resolve_selected_branches() {
+  local selected=()
+  if [ ${#BRANCH_PATTERNS[@]} -eq 0 ] && [ $INCLUDE_ALL -eq 0 ]; then
+    # Default: only local branches (avoid remotes unless requested)
+    mapfile -t selected < <(gex_git_local_branches)
+  else
+    local ref p keep
+    for ref in "${ALL_REFS[@]}"; do
+      keep=0
+      if [ ${#BRANCH_PATTERNS[@]} -eq 0 ] && [ $INCLUDE_ALL -eq 1 ]; then
+        keep=1
+      else
+        for p in "${BRANCH_PATTERNS[@]}"; do
+          if gex_match_glob "$ref" "$p"; then
+            keep=1; break
+          fi
+        done
+      fi
+      if [ $keep -eq 1 ]; then
+        # Apply exclude patterns
+        local ep
+        for ep in "${EXCLUDE_PATTERNS[@]}"; do
+          if gex_match_glob "$ref" "$ep"; then
+            keep=0; break
+          fi
+        done
+      fi
+      [ $keep -eq 1 ] && selected+=("$ref")
+    done
+  fi
+  printf '%s\n' "${selected[@]}" | awk '!seen[$0]++'
+}
+
+mapfile -t SELECTED < <(resolve_selected_branches)
+
+[ ${#SELECTED[@]} -gt 0 ] || gex_die "No branches matched selection (patterns: ${BRANCH_PATTERNS[*]:-<none>})."
+
+# Build rev args including negative refs for explicit excludes
+REV_ARGS=("${SELECTED[@]}")
+
+if [ ${#EXCLUDE_PATTERNS[@]} -gt 0 ]; then
+  for ep in "${EXCLUDE_PATTERNS[@]}"; do
+    for ref in "${ALL_REFS[@]}"; do
+      if gex_match_glob "$ref" "$ep"; then
+        REV_ARGS+=("^$ref")
+      fi
+    done
+  done
+fi
+
+# Always include HEAD if detached or not reachable via selected branches
+if gex_git_is_detached; then
+  REV_ARGS+=("HEAD")
+fi
+
+# -------------------------
+# Build git log arguments
+# -------------------------
+LOG_ARGS=( "--graph" "--date=short" )
+
+case "$DECORATE" in
+  no) LOG_ARGS+=( "--no-decorate" );;
+  *)  LOG_ARGS+=( "--decorate=$DECORATE" );;
+esac
+
+[ -n "$SINCE" ] && LOG_ARGS+=( "--since=$SINCE" )
+[ -n "$UNTIL" ] && LOG_ARGS+=( "$UNTIL" )
+[ -n "$AUTHOR" ] && LOG_ARGS+=( "--author=$AUTHOR" )
+[ $MERGES_ONLY -eq 1 ] && LOG_ARGS+=( "--merges" )
+[ -n "$MAX" ] && LOG_ARGS+=( "--max-count=$MAX" )
+
+if [ $NO_COLOR_FLAG -eq 1 ]; then
+  FORMAT="%h %ad %an %s%d"
+  LOG_ARGS+=( "--no-color" )
+else
+  FORMAT="%C(auto)%h%Creset %C(bold blue)%ad%Creset %C(yellow)%an%Creset %s%C(auto)%d%Creset"
+fi
+
+LOG_ARGS+=( "--pretty=format:$FORMAT" )
+
+# -------------------------
+# Highlight patterns -> regex
+# -------------------------
+HIGHLIGHT_REGEX=""
+if [ ${#HIGHLIGHT_PATTERNS[@]} -gt 0 ] && [ $NO_COLOR_FLAG -eq 0 ]; then
+  for hl in "${HIGHLIGHT_PATTERNS[@]}"; do
+    # Escape regex meta chars
+    esc=$(printf '%s' "$hl" | sed 's/[.^$+?(){}|[\]\\]/\\&/g' | sed 's/\*/.*/g')
+    if [ -z "$HIGHLIGHT_REGEX" ]; then
+      HIGHLIGHT_REGEX="$esc"
+    else
+      HIGHLIGHT_REGEX="$HIGHLIGHT_REGEX|$esc"
+    fi
+  done
+fi
+
+# -------------------------
+# Render pipeline
+# -------------------------
+
+run_git_log() {
+  # Removed '--' so branch/ref arguments are treated as revisions (previously passed as pathspecs).
+  git log "${LOG_ARGS[@]}" "${REV_ARGS[@]}"
+}
+
+apply_highlight() {
+  # Highlight only decoration segments containing highlight patterns.
+  # This is a heuristic; for deeper accuracy, a custom renderer is needed.
+  if [ -z "$HIGHLIGHT_REGEX" ] || [ $NO_COLOR_FLAG -eq 1 ]; then
+    cat
+  else
+    # Bold magenta for matched decoration block
+    sed -E "s/(\(.*($HIGHLIGHT_REGEX).*?\))/$(printf '\033[1;35m')\1$(printf '\033[0m')/g"
+  fi
+}
+
+apply_style_unicode() {
+  # Simple substitution; does not yet handle complex ASCII alignment issues.
+  sed -E '
+    s/\*/●/g;
+    s/\|/│/g;
+    s/\//╱/g;
+    s/\\/╲/g;
+  '
+}
+
+# Execution flow
+if [ "$STYLE" = "unicode" ] && [ $NO_COLOR_FLAG -eq 0 ]; then
+  run_git_log | apply_highlight | apply_style_unicode
+else
+  run_git_log | apply_highlight
+fi
+
+# End of graph command
