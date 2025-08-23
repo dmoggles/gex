@@ -398,7 +398,6 @@ if "${push_cmd[@]}"; then
   echo "  gex publish  # Push additional commits"
   echo
   echo "  # Or create a pull request:"
-  local repo_url
   repo_url="$(git remote get-url "$REMOTE_NAME" 2>/dev/null || echo "")"
   if [[ "$repo_url" =~ github\.com ]]; then
     echo "  # GitHub: Create PR at the repository's GitHub page"
