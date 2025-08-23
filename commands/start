@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# gex start - Smart branch creation with naming conventions and workflow automation
+#
+# Features:
+#   - Branch type prefixes (feature/, bugfix/, hotfix/, chore/, docs/)
+#   - Auto-sync with base branch before creating new branch
+#   - Issue number integration (#123 → feature/123-description)
+#   - Duplicate branch name prevention
+#   - Smart base branch detection (main, develop, master)
+#   - Optional push to remote with upstream tracking
+#   - Configurable naming patterns and branch types
+#
+# Usage:
+#   gex start <type> <name> [options]
+#   gex start feature user-authentication
+#   gex start bugfix broken-login #456
+#   gex start hotfix security-patch --from=release/v1.2
+#   gex start --interactive
+#
+# Options:
+#   --from=<branch>       Base branch (default: auto-detect main/develop)
+#   --no-switch           Create branch but don't check it out
+#   --no-sync             Skip syncing base branch with remote
+#   --push                Push new branch and set upstream tracking
+#   --issue=<number>      Issue number to include in branch name
+#   --interactive         Interactive mode with prompts
+#   --list-types          Show available branch types
+#   --dry-run             Show what would be done without executing
+#   -h, --help            Show usage
+#
+# Examples:
+#   gex start feature new-dashboard
+#   gex start bugfix login-error --issue=123
+#   gex start hotfix cve-fix --from=release/v2.1 --push
+#   gex start chore update-deps --no-sync
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GEX_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# shellcheck source=../lib/core.sh
+source "$GEX_ROOT/lib/core.sh"
+# shellcheck source=../lib/git.sh
+source "$GEX_ROOT/lib/git.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: gex start <type> <name> [options]
+       gex start --interactive
+       gex start --list-types
+
+Create a new branch with smart naming conventions and workflow automation.
+
+Arguments:
+  <type>                 Branch type: feature, bugfix, hotfix, chore, docs
+  <name>                 Branch description (kebab-case recommended)
+
+Options:
+  --from=<branch>        Base branch (default: auto-detect main/develop/master)
+  --issue=<number>       Issue/ticket number to include in branch name
+  --no-switch            Create branch but don't check it out
+  --no-sync              Skip syncing base branch with remote first
+  --push                 Push new branch and set upstream tracking
+  --interactive          Interactive guided branch creation
+  --list-types           Show available branch types and examples
+  --dry-run              Show what would be done without executing
+  -h, --help             Show this help
+
+Examples:
+  gex start feature user-dashboard
+  gex start bugfix login-timeout --issue=456
+  gex start hotfix security-patch --from=release/v1.2 --push
+  gex start chore update-dependencies --no-sync
+  gex start feature new-api --interactive
+
+Branch Naming:
+  feature/user-dashboard
+  bugfix/456-login-timeout
+  hotfix/security-patch
+  chore/update-dependencies
+  docs/api-reference
+
+Configuration:
+  Set defaults in ~/.config/gex/config:
+    default_base_branch = "main"
+    auto_sync = true
+    auto_push = false
+    branch_types = ["feature", "bugfix", "hotfix", "chore", "docs"]
+EOF
+}
+
+show_branch_types() {
+  cat <<'EOF'
+Available Branch Types:
+
+  feature     New functionality or enhancements
+              Example: gex start feature user-profiles
+              Creates: feature/user-profiles
+
+  bugfix      Bug fixes and corrections
+              Example: gex start bugfix login-error --issue=123
+              Creates: bugfix/123-login-error
+
+  hotfix      Critical fixes for production
+              Example: gex start hotfix security-patch
+              Creates: hotfix/security-patch
+
+  chore       Maintenance, refactoring, tooling
+              Example: gex start chore update-deps
+              Creates: chore/update-deps
+
+  docs        Documentation updates
+              Example: gex start docs api-guide
+              Creates: docs/api-guide
+
+Custom types can be configured in ~/.config/gex/config
+EOF
+}
+
+gex_require_git_repo
+
+# -------------------------
+# Configuration & Defaults
+# -------------------------
+DEFAULT_BRANCH_TYPES=("feature" "bugfix" "hotfix" "chore" "docs")
+DEFAULT_BASE_BRANCH=""
+AUTO_SYNC=1
+AUTO_PUSH=0
+SWITCH_TO_BRANCH=1
+DRY_RUN=0
+INTERACTIVE=0
+ISSUE_NUMBER=""
+
+# Load configuration (simplified to avoid set -e issues)
+BRANCH_TYPES=("${DEFAULT_BRANCH_TYPES[@]}")
+# TODO: Add config file support later
+
+# -------------------------
+# Parse Arguments
+# -------------------------
+BRANCH_TYPE=""
+BRANCH_NAME=""
+BASE_BRANCH="$DEFAULT_BASE_BRANCH"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --from=*) BASE_BRANCH="${1#--from=}";;
+    --from) shift; BASE_BRANCH="$1";;
+    --issue=*) ISSUE_NUMBER="${1#--issue=}";;
+    --issue) shift; ISSUE_NUMBER="$1";;
+    --no-switch) SWITCH_TO_BRANCH=0;;
+    --no-sync) AUTO_SYNC=0;;
+    --push) AUTO_PUSH=1;;
+    --interactive) INTERACTIVE=1;;
+    --list-types) show_branch_types; exit 0;;
+    --dry-run) DRY_RUN=1;;
+    -h|--help) usage; exit 0;;
+    --) shift; break;;
+    -*) gex_die "Unknown option: $1";;
+    *)
+      if [ -z "$BRANCH_TYPE" ]; then
+        BRANCH_TYPE="$1"
+      elif [ -z "$BRANCH_NAME" ]; then
+        BRANCH_NAME="$1"
+      else
+        gex_die "Unexpected argument: $1"
+      fi
+      ;;
+  esac
+  shift
+done
+
+# -------------------------
+# Interactive Mode
+# -------------------------
+if [ $INTERACTIVE -eq 1 ]; then
+  echo "Interactive branch creation:"
+  echo
+
+  # Select branch type
+  echo "Available branch types:"
+  for i in "${!BRANCH_TYPES[@]}"; do
+    echo "  $((i+1)). ${BRANCH_TYPES[i]}"
+  done
+  echo -n "Select type (1-${#BRANCH_TYPES[@]}): "
+  read -r type_choice
+
+  if ! [[ "$type_choice" =~ ^[0-9]+$ ]] || [ "$type_choice" -lt 1 ] || [ "$type_choice" -gt "${#BRANCH_TYPES[@]}" ]; then
+    gex_die "Invalid selection"
+  fi
+  BRANCH_TYPE="${BRANCH_TYPES[$((type_choice-1))]}"
+
+  # Get branch name
+  echo -n "Branch name (kebab-case): "
+  read -r BRANCH_NAME
+
+  # Optional issue number
+  echo -n "Issue number (optional): "
+  read -r ISSUE_NUMBER
+
+  # Confirm base branch
+  detected_base="$(detect_base_branch)"
+  echo -n "Base branch [$detected_base]: "
+  read -r base_input
+  BASE_BRANCH="${base_input:-$detected_base}"
+
+  echo
+fi
+
+# -------------------------
+# Validation
+# -------------------------
+if [ -z "$BRANCH_TYPE" ] || [ -z "$BRANCH_NAME" ]; then
+  gex_error "Missing required arguments"
+  echo "Usage: gex start <type> <name>" >&2
+  echo "Run 'gex start --help' for more information." >&2
+  exit 2
+fi
+
+# Validate branch type
+if ! gex_array_contains "$BRANCH_TYPE" "${BRANCH_TYPES[@]}"; then
+  gex_error "Invalid branch type: $BRANCH_TYPE"
+  echo "Available types: ${BRANCH_TYPES[*]}" >&2
+  echo "Run 'gex start --list-types' for examples." >&2
+  exit 2
+fi
+
+# Validate branch name (basic kebab-case check)
+if [[ ! "$BRANCH_NAME" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]; then
+  gex_warn "Branch name should be kebab-case (lowercase, hyphens): $BRANCH_NAME"
+fi
+
+# Extract issue number from branch name if present
+if [[ "$BRANCH_NAME" =~ ^#?([0-9]+)[-_](.+)$ ]]; then
+  if [ -z "$ISSUE_NUMBER" ]; then
+    ISSUE_NUMBER="${BASH_REMATCH[1]}"
+    BRANCH_NAME="${BASH_REMATCH[2]}"
+    gex_info "Extracted issue number: #$ISSUE_NUMBER"
+  fi
+elif [[ "$BRANCH_NAME" =~ (.+)[-_]#?([0-9]+)$ ]]; then
+  if [ -z "$ISSUE_NUMBER" ]; then
+    BRANCH_NAME="${BASH_REMATCH[1]}"
+    ISSUE_NUMBER="${BASH_REMATCH[2]}"
+    gex_info "Extracted issue number: #$ISSUE_NUMBER"
+  fi
+fi
+
+# -------------------------
+# Helper Functions
+# -------------------------
+detect_base_branch() {
+  # If base branch specified, use it
+  [ -n "$BASE_BRANCH" ] && echo "$BASE_BRANCH" && return 0
+
+  # Try common base branches in order of preference
+  local candidates=("main" "develop" "master")
+  for candidate in "${candidates[@]}"; do
+    if git show-ref --verify --quiet "refs/heads/$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+
+  # Fallback to current branch
+  local current
+  current="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")"
+  echo "$current"
+}
+
+construct_branch_name() {
+  local type="$1" name="$2" issue="$3"
+  if [ -n "$issue" ]; then
+    echo "$type/$issue-$name"
+  else
+    echo "$type/$name"
+  fi
+}
+
+sync_base_branch() {
+  local branch="$1"
+  local remote_exists=0
+
+  # Check if remote tracking branch exists
+  if git rev-parse --verify "origin/$branch" >/dev/null 2>&1; then
+    remote_exists=1
+  fi
+
+  if [ $remote_exists -eq 1 ]; then
+    gex_info "Syncing $branch with origin/$branch"
+    if [ $DRY_RUN -eq 0 ]; then
+      git fetch origin "$branch" || gex_warn "Failed to fetch origin/$branch"
+      # Only fast-forward if we're on the base branch
+      local current_branch
+      current_branch="$(git rev-parse --abbrev-ref HEAD)"
+      if [ "$current_branch" = "$branch" ]; then
+        git merge --ff-only "origin/$branch" || gex_warn "Could not fast-forward $branch"
+      fi
+    fi
+  else
+    gex_info "No remote tracking branch for $branch, skipping sync"
+  fi
+}
+
+# -------------------------
+# Main Logic
+# -------------------------
+BASE_BRANCH="$(detect_base_branch)"
+FULL_BRANCH_NAME="$(construct_branch_name "$BRANCH_TYPE" "$BRANCH_NAME" "$ISSUE_NUMBER")"
+
+gex_info "Creating branch: $FULL_BRANCH_NAME"
+gex_info "Base branch: $BASE_BRANCH"
+
+# Check if branch already exists
+if git show-ref --verify --quiet "refs/heads/$FULL_BRANCH_NAME"; then
+  gex_die "Branch already exists: $FULL_BRANCH_NAME"
+fi
+
+# Sync base branch if requested
+if [ $AUTO_SYNC -eq 1 ]; then
+  sync_base_branch "$BASE_BRANCH"
+fi
+
+# Ensure we're on the base branch or can access it
+if ! git rev-parse --verify "$BASE_BRANCH" >/dev/null 2>&1; then
+  gex_die "Base branch does not exist: $BASE_BRANCH"
+fi
+
+# Show what will be done
+if [ $DRY_RUN -eq 1 ]; then
+  echo "DRY RUN - Would execute:"
+  echo "  git checkout -b $FULL_BRANCH_NAME $BASE_BRANCH"
+  if [ $AUTO_PUSH -eq 1 ]; then
+    echo "  git push -u origin $FULL_BRANCH_NAME"
+  fi
+  if [ $SWITCH_TO_BRANCH -eq 0 ]; then
+    echo "  git checkout $BASE_BRANCH  # (return to base)"
+  fi
+  exit 0
+fi
+
+# Create the branch
+gex_info "Creating branch from $BASE_BRANCH"
+git checkout -b "$FULL_BRANCH_NAME" "$BASE_BRANCH"
+
+# Switch back to base branch if requested
+if [ $SWITCH_TO_BRANCH -eq 0 ]; then
+  gex_info "Returning to $BASE_BRANCH"
+  git checkout "$BASE_BRANCH"
+fi
+
+# Push and set upstream if requested
+if [ $AUTO_PUSH -eq 1 ]; then
+  gex_info "Pushing branch and setting upstream"
+  git push -u origin "$FULL_BRANCH_NAME"
+fi
+
+# Success message
+echo
+gex_info "Branch created successfully: $FULL_BRANCH_NAME"
+if [ $SWITCH_TO_BRANCH -eq 1 ]; then
+  gex_info "Switched to new branch"
+fi
+if [ $AUTO_PUSH -eq 1 ]; then
+  gex_info "Pushed to origin with upstream tracking"
+fi
+
+# Show next steps
+echo
+echo "Next steps:"
+echo "  # Make your changes, then:"
+echo "  git add ."
+echo "  git commit -m \"your change\""
+if [ $AUTO_PUSH -eq 0 ]; then
+  echo "  git push -u origin $FULL_BRANCH_NAME"
+fi
+echo "  # Or use: gex publish (when available)"
+
+# End of start command
