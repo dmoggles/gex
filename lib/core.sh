@@ -213,7 +213,7 @@ gex__read_config_file_value() {
 gex_config_get() {
   local key="$1"
   [ -n "$key" ] || gex_die "config_get requires a key"
-  local env_key="GEX_${key^^}"
+  local env_key="GEX_$(echo "$key" | tr '[:lower:]' '[:upper:]')"
 
   # 1. Repo local
   if git rev-parse --show-toplevel >/dev/null 2>&1; then

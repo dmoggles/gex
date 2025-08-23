@@ -84,40 +84,42 @@ Branch Naming:
   docs/api-reference
 
 Configuration:
-  Set defaults in ~/.config/gex/config:
-    default_base_branch = "main"
+  Set defaults in ~/.config/gex/config or .gexrc in repo root:
+    default_base_branch = main
     auto_sync = true
     auto_push = false
-    branch_types = ["feature", "bugfix", "hotfix", "chore", "docs"]
+    branch_types = feature,bugfix,hotfix,chore,docs
+
+  Example for repositories using "features" and "patches":
+    branch_types = features,bugfix,patches,chore,docs
+
+  Example for minimal set:
+    branch_types = features,patches
 EOF
 }
 
 show_branch_types() {
-  cat <<'EOF'
-Available Branch Types:
+  echo "Available Branch Types:"
+  echo
 
-  feature     New functionality or enhancements
-              Example: gex start feature user-profiles
-              Creates: feature/user-profiles
+  for type in "${BRANCH_TYPES[@]}"; do
+    echo "  $type"
+    echo "              Example: gex start $type my-description"
+    echo "              Creates: $type/my-description"
+    echo
+  done
 
-  bugfix      Bug fixes and corrections
-              Example: gex start bugfix login-error --issue=123
-              Creates: bugfix/123-login-error
-
-  hotfix      Critical fixes for production
-              Example: gex start hotfix security-patch
-              Creates: hotfix/security-patch
-
-  chore       Maintenance, refactoring, tooling
-              Example: gex start chore update-deps
-              Creates: chore/update-deps
-
-  docs        Documentation updates
-              Example: gex start docs api-guide
-              Creates: docs/api-guide
-
-Custom types can be configured in ~/.config/gex/config
-EOF
+  echo "Custom types can be configured in ~/.config/gex/config or .gexrc in repo root."
+  echo
+  echo "Configuration Examples:"
+  echo "  # For repos using \"features\" instead of \"feature\""
+  echo "  branch_types = features,bugfix,patches,chore,docs"
+  echo
+  echo "  # Minimal configuration"
+  echo "  branch_types = features,patches"
+  echo
+  echo "Current configuration:"
+  echo "  branch_types = $(printf '%s,' "${BRANCH_TYPES[@]}" | sed 's/,$//')"
 }
 
 gex_require_git_repo
@@ -134,9 +136,48 @@ DRY_RUN=0
 INTERACTIVE=0
 ISSUE_NUMBER=""
 
-# Load configuration (simplified to avoid set -e issues)
-BRANCH_TYPES=("${DEFAULT_BRANCH_TYPES[@]}")
-# TODO: Add config file support later
+# Load configuration safely (simplified to avoid bash 3.2 issues)
+load_config() {
+  # Check if we're in a git repo for local config
+  local config_file=""
+  if git rev-parse --show-toplevel >/dev/null 2>&1; then
+    local repo_root
+    repo_root="$(git rev-parse --show-toplevel)"
+    if [ -f "$repo_root/.gexrc" ]; then
+      config_file="$repo_root/.gexrc"
+    fi
+  fi
+
+  # Fallback to global config
+  if [ -z "$config_file" ] && [ -f "$GEX_CONFIG_DIR/config" ]; then
+    config_file="$GEX_CONFIG_DIR/config"
+  fi
+
+  # Parse config file if it exists
+  if [ -n "$config_file" ]; then
+    # Parse branch_types
+    local config_types
+    config_types="$(grep -E "^[[:space:]]*branch_types[[:space:]]*=" "$config_file" 2>/dev/null | head -n1 | sed -E 's/^[[:space:]]*branch_types[[:space:]]*=[[:space:]]*//' | sed -E 's/[[:space:]]*$//' || true)"
+
+    if [ -n "$config_types" ]; then
+      BRANCH_TYPES=()
+      # Parse comma-separated list
+      local oldIFS="$IFS"
+      IFS=','
+      for type in $config_types; do
+        # Trim whitespace
+        type="$(echo "$type" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+        [ -n "$type" ] && BRANCH_TYPES+=("$type")
+      done
+      IFS="$oldIFS"
+    fi
+
+    # Parse default_base_branch
+    local base_config
+    base_config="$(grep -E "^[[:space:]]*default_base_branch[[:space:]]*=" "$config_file" 2>/dev/null | head -n1 | sed -E 's/^[[:space:]]*default_base_branch[[:space:]]*=[[:space:]]*//' | sed -E 's/[[:space:]]*$//' || true)"
+    [ -n "$base_config" ] && DEFAULT_BASE_BRANCH="$base_config"
+  fi
+}
 
 # -------------------------
 # Parse Arguments
@@ -144,6 +185,9 @@ BRANCH_TYPES=("${DEFAULT_BRANCH_TYPES[@]}")
 BRANCH_TYPE=""
 BRANCH_NAME=""
 BASE_BRANCH="$DEFAULT_BASE_BRANCH"
+
+# Initialize with defaults before config loading
+BRANCH_TYPES=("${DEFAULT_BRANCH_TYPES[@]}")
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -155,7 +199,7 @@ while [ $# -gt 0 ]; do
     --no-sync) AUTO_SYNC=0;;
     --push) AUTO_PUSH=1;;
     --interactive) INTERACTIVE=1;;
-    --list-types) show_branch_types; exit 0;;
+    --list-types) load_config; show_branch_types; exit 0;;
     --dry-run) DRY_RUN=1;;
     -h|--help) usage; exit 0;;
     --) shift; break;;
@@ -172,6 +216,9 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# Load config after parsing arguments (so --help works without config issues)
+load_config
 
 # -------------------------
 # Interactive Mode

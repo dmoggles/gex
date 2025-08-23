@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# gex config - Configuration management for gex
+#
+# Features:
+#   - Set and get configuration values
+#   - Initialize config files (global and repo-local)
+#   - Show current configuration
+#   - Validate configuration values
+#   - Examples for common setups
+#
+# Usage:
+#   gex config get <key>
+#   gex config set <key> <value>
+#   gex config list
+#   gex config init [--global|--local]
+#   gex config example <preset>
+#
+# Options:
+#   --global              Operate on global config (~/.config/gex/config)
+#   --local               Operate on repo config (.gexrc)
+#   --help                Show usage
+#
+# Examples:
+#   gex config set branch_types "features,patches,hotfix"
+#   gex config set default_base_branch develop
+#   gex config get branch_types
+#   gex config init --local
+#   gex config example features-patches
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GEX_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# shellcheck source=../lib/core.sh
+source "$GEX_ROOT/lib/core.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: gex config <command> [options]
+
+Commands:
+  get <key>                Get configuration value
+  set <key> <value>        Set configuration value
+  unset <key>              Remove configuration key
+  list                     Show all configuration
+  init [--global|--local]  Initialize config file with examples
+  example <preset>         Show configuration examples
+  edit                     Open config file in editor
+
+Options:
+  --global                 Use global config (~/.config/gex/config)
+  --local                  Use repo config (.gexrc)
+  --help                   Show this help
+
+Examples:
+  gex config set branch_types "features,patches,chore"
+  gex config set default_base_branch develop
+  gex config get branch_types
+  gex config list
+  gex config init --local
+  gex config example features-patches
+
+Configuration Keys:
+  branch_types            Comma-separated list of allowed branch types
+  default_base_branch     Default branch to create new branches from
+  auto_sync              Auto-sync base branch before creating (true/false)
+  auto_push              Auto-push new branches (true/false)
+EOF
+}
+
+show_examples() {
+  local preset="${1:-all}"
+
+  case "$preset" in
+    features-patches|fp)
+      cat <<'EOF'
+# Configuration for repos using "features" and "patches"
+branch_types = features,patches,hotfix,chore
+default_base_branch = develop
+auto_sync = true
+auto_push = false
+EOF
+      ;;
+    minimal)
+      cat <<'EOF'
+# Minimal configuration
+branch_types = features,patches
+default_base_branch = main
+EOF
+      ;;
+    conventional|conv)
+      cat <<'EOF'
+# Conventional commits style
+branch_types = feat,fix,chore,docs,style,refactor,test
+default_base_branch = main
+auto_sync = true
+EOF
+      ;;
+    gitflow)
+      cat <<'EOF'
+# GitFlow style
+branch_types = feature,bugfix,hotfix,release,support
+default_base_branch = develop
+auto_sync = true
+EOF
+      ;;
+    all|*)
+      echo "Available presets:"
+      echo
+      echo "features-patches (fp)  - For repos using 'features' and 'patches'"
+      echo "minimal               - Minimal setup"
+      echo "conventional (conv)   - Conventional commits style"
+      echo "gitflow              - GitFlow workflow"
+      echo
+      echo "Use: gex config example <preset>"
+      ;;
+  esac
+}
+
+# Determine config file to use
+get_config_file() {
+  local scope="${1:-auto}"
+
+  case "$scope" in
+    global)
+      echo "$GEX_CONFIG_DIR/config"
+      ;;
+    local)
+      if git rev-parse --show-toplevel >/dev/null 2>&1; then
+        local repo_root
+        repo_root="$(git rev-parse --show-toplevel)"
+        echo "$repo_root/.gexrc"
+      else
+        gex_die "Not in a git repository. Use --global or run from a git repo."
+      fi
+      ;;
+    auto)
+      # Default to local if in repo, global otherwise
+      if git rev-parse --show-toplevel >/dev/null 2>&1; then
+        get_config_file local
+      else
+        get_config_file global
+      fi
+      ;;
+  esac
+}
+
+# Parse arguments
+SCOPE="auto"
+COMMAND=""
+ARGS=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --global) SCOPE="global";;
+    --local) SCOPE="local";;
+    -h|--help) usage; exit 0;;
+    --) shift; break;;
+    -*) gex_die "Unknown option: $1";;
+    *)
+      if [ -z "$COMMAND" ]; then
+        COMMAND="$1"
+      else
+        ARGS+=("$1")
+      fi
+      ;;
+  esac
+  shift
+done
+
+[ -n "$COMMAND" ] || { usage; exit 2; }
+
+CONFIG_FILE="$(get_config_file "$SCOPE")"
+
+# Ensure config directory exists
+mkdir -p "$(dirname "$CONFIG_FILE")"
+
+config_get() {
+  local key="$1"
+  if [ -f "$CONFIG_FILE" ]; then
+    # Simple key = value parser
+    grep -E "^[[:space:]]*${key}[[:space:]]*=" "$CONFIG_FILE" 2>/dev/null | \
+      head -n1 | \
+      sed -E 's/^[[:space:]]*[^=]+=[[:space:]]*//' | \
+      sed -E 's/[[:space:]]*$//'
+  fi
+}
+
+config_set() {
+  local key="$1" value="$2"
+
+  # Validate key
+  case "$key" in
+    branch_types|default_base_branch|auto_sync|auto_push) ;;
+    *) gex_warn "Unknown configuration key: $key" ;;
+  esac
+
+  # Create file if it doesn't exist
+  if [ ! -f "$CONFIG_FILE" ]; then
+    touch "$CONFIG_FILE"
+  fi
+
+  # Remove existing key if present
+  if grep -q "^[[:space:]]*${key}[[:space:]]*=" "$CONFIG_FILE" 2>/dev/null; then
+    # Use a temp file for portability
+    local temp_file
+    temp_file="$(mktemp)"
+    grep -v "^[[:space:]]*${key}[[:space:]]*=" "$CONFIG_FILE" > "$temp_file"
+    mv "$temp_file" "$CONFIG_FILE"
+  fi
+
+  # Add new value
+  echo "$key = $value" >> "$CONFIG_FILE"
+  gex_info "Set $key = $value in $CONFIG_FILE"
+}
+
+config_unset() {
+  local key="$1"
+  if [ -f "$CONFIG_FILE" ] && grep -q "^[[:space:]]*${key}[[:space:]]*=" "$CONFIG_FILE"; then
+    local temp_file
+    temp_file="$(mktemp)"
+    grep -v "^[[:space:]]*${key}[[:space:]]*=" "$CONFIG_FILE" > "$temp_file"
+    mv "$temp_file" "$CONFIG_FILE"
+    gex_info "Removed $key from $CONFIG_FILE"
+  else
+    gex_warn "Key not found: $key"
+  fi
+}
+
+config_list() {
+  if [ -f "$CONFIG_FILE" ]; then
+    echo "Configuration file: $CONFIG_FILE"
+    echo
+    # Show non-comment, non-empty lines
+    grep -E '^[^#]*=' "$CONFIG_FILE" 2>/dev/null || echo "(empty)"
+  else
+    echo "No configuration file found at: $CONFIG_FILE"
+    echo "Run 'gex config init' to create one."
+  fi
+}
+
+config_init() {
+  if [ -f "$CONFIG_FILE" ]; then
+    echo "Configuration file already exists: $CONFIG_FILE"
+    echo -n "Overwrite? [y/N]: "
+    read -r response
+    case "$response" in
+      [yY]|[yY][eE][sS]) ;;
+      *) echo "Cancelled."; exit 0;;
+    esac
+  fi
+
+  cat > "$CONFIG_FILE" <<'EOF'
+# gex configuration file
+#
+# This file configures default behavior for gex commands.
+# Lines starting with # are comments.
+#
+# Available settings:
+
+# Branch types for 'gex start' command (comma-separated)
+branch_types = feature,bugfix,hotfix,chore,docs
+
+# Default base branch for new branches
+default_base_branch = main
+
+# Automatically sync base branch before creating new branch
+auto_sync = true
+
+# Automatically push new branches and set upstream
+auto_push = false
+
+# Examples for different workflows:
+#
+# For repos using "features" and "patches":
+# branch_types = features,patches,hotfix,chore
+# default_base_branch = develop
+#
+# For conventional commits:
+# branch_types = feat,fix,chore,docs,style,refactor,test
+#
+# For GitFlow:
+# branch_types = feature,bugfix,hotfix,release,support
+# default_base_branch = develop
+EOF
+
+  gex_info "Created configuration file: $CONFIG_FILE"
+  echo
+  echo "Edit the file to customize branch types and defaults."
+  echo "Common presets available with: gex config example <preset>"
+}
+
+config_edit() {
+  local editor="${EDITOR:-nano}"
+  if [ ! -f "$CONFIG_FILE" ]; then
+    config_init
+  fi
+  "$editor" "$CONFIG_FILE"
+}
+
+# Execute command
+case "$COMMAND" in
+  get)
+    [ ${#ARGS[@]} -eq 1 ] || gex_die "Usage: gex config get <key>"
+    value="$(config_get "${ARGS[0]}")"
+    if [ -n "$value" ]; then
+      echo "$value"
+    else
+      exit 1
+    fi
+    ;;
+  set)
+    [ ${#ARGS[@]} -eq 2 ] || gex_die "Usage: gex config set <key> <value>"
+    config_set "${ARGS[0]}" "${ARGS[1]}"
+    ;;
+  unset)
+    [ ${#ARGS[@]} -eq 1 ] || gex_die "Usage: gex config unset <key>"
+    config_unset "${ARGS[0]}"
+    ;;
+  list)
+    config_list
+    ;;
+  init)
+    config_init
+    ;;
+  example)
+    preset="${ARGS[0]:-all}"
+    show_examples "$preset"
+    ;;
+  edit)
+    config_edit
+    ;;
+  *)
+    gex_die "Unknown command: $COMMAND"
+    ;;
+esac
