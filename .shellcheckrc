@@ -1,0 +1,33 @@
+# .shellcheckrc - Project-level configuration for ShellCheck
+#
+# Reference:
+#   https://github.com/koalaman/shellcheck/wiki/Directive
+#
+# Rationale:
+#   gex intentionally sources scripts whose paths are resolved at runtime and
+#   may live outside the current directory (for plugin extensibility). This
+#   triggers SC1090/SC1091 (can't follow non-constant source). We disable them
+#   globally to avoid annotating every dynamic 'source' line.
+#
+#   Some warnings are conditionally useful but noisy for this project style.
+#   Keep the excluded list as small as possible; revisit periodically.
+
+# Disabled checks (space/comma separated is allowed; we use commas for clarity)
+# SC1090 / SC1091: dynamic or non-constant source paths (plugin architecture)
+# SC2155: command substitution in declare/assignment (occasionally used for brevity)
+# SC2317: unreachable code (false positives in set -e + trap patterns)
+# SC2034: unused variables (sometimes used for documentation / future use markers)
+exclude=SC1090,SC1091,SC2155,SC2317,SC2034
+
+# Optional: set severity threshold (style > info > warning > error)
+# uncomment to hide purely stylistic suggestions
+# severity=warning
+
+# Source path hints (can help if you vendor external libs later)
+# source-path=/usr/local/lib:/opt/scripts
+
+# Enable external sources following if you later vendor dependencies
+# follow-sources=yes
+
+# Colorized output (ShellCheck CLI flag can override)
+# color=auto
