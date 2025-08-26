@@ -256,8 +256,10 @@ get_trackable_branches() {
 
 # Interactive branch selection
 interactive_select_branches() {
-  local available_branches
-  mapfile -t available_branches < <(get_trackable_branches)
+  local available_branches=()
+  while IFS= read -r branch; do
+    available_branches+=("$branch")
+  done < <(get_trackable_branches)
 
   if [ ${#available_branches[@]} -eq 0 ]; then
     gex_die "No branches with upstream tracking found"
@@ -492,9 +494,15 @@ show_sync_plan() {
 
 # Determine which branches to sync
 if [ $INTERACTIVE_MODE -eq 1 ]; then
-  mapfile -t TARGET_BRANCHES < <(interactive_select_branches)
+  TARGET_BRANCHES=()
+  while IFS= read -r branch; do
+    TARGET_BRANCHES+=("$branch")
+  done < <(interactive_select_branches)
 elif [ $SYNC_ALL -eq 1 ]; then
-  mapfile -t TARGET_BRANCHES < <(get_trackable_branches)
+  TARGET_BRANCHES=()
+  while IFS= read -r branch; do
+    TARGET_BRANCHES+=("$branch")
+  done < <(get_trackable_branches)
 elif [ ${#TARGET_BRANCHES[@]} -eq 0 ]; then
   # Default: current branch
   current_branch="$(gex_git_current_branch)"
