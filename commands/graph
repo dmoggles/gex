@@ -185,13 +185,15 @@ resolve_selected_branches() {
       if [ ${#BRANCH_PATTERNS[@]} -eq 0 ] && [ $INCLUDE_ALL -eq 1 ]; then
         keep=1
       else
-        for p in "${BRANCH_PATTERNS[@]}"; do
-          if gex_match_glob "$ref" "$p"; then
-            keep=1; break
-          fi
-        done
+        if [ ${#BRANCH_PATTERNS[@]} -gt 0 ]; then
+          for p in "${BRANCH_PATTERNS[@]}"; do
+            if gex_match_glob "$ref" "$p"; then
+              keep=1; break
+            fi
+          done
+        fi
       fi
-      if [ $keep -eq 1 ]; then
+      if [ $keep -eq 1 ] && [ ${#EXCLUDE_PATTERNS[@]} -gt 0 ]; then
         # Apply exclude patterns
         local ep
         for ep in "${EXCLUDE_PATTERNS[@]}"; do
@@ -218,11 +220,13 @@ REV_ARGS=("${SELECTED[@]}")
 
 if [ ${#EXCLUDE_PATTERNS[@]} -gt 0 ]; then
   for ep in "${EXCLUDE_PATTERNS[@]}"; do
-    for ref in "${ALL_REFS[@]}"; do
-      if gex_match_glob "$ref" "$ep"; then
-        REV_ARGS+=("^$ref")
-      fi
-    done
+    if [ ${#ALL_REFS[@]} -gt 0 ]; then
+      for ref in "${ALL_REFS[@]}"; do
+        if gex_match_glob "$ref" "$ep"; then
+          REV_ARGS+=("^$ref")
+        fi
+      done
+    fi
   done
 fi
 
