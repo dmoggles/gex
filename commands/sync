@@ -1,0 +1,610 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# gex sync - Smart branch synchronization with upstream tracking and safety checks
+#
+# Features:
+#   - Update current branch or multiple branches with latest upstream changes
+#   - Support for merge and rebase strategies
+#   - Bulk operations across all branches with upstream tracking
+#   - Remote pruning to clean up stale references
+#   - Interactive branch selection for targeted updates
+#   - Comprehensive safety checks and conflict detection
+#   - Integration with gex workflow and configuration system
+#   - Dry run mode for previewing operations
+#
+# Usage:
+#   gex sync [options] [branch...]
+#   gex sync --all --strategy=rebase
+#   gex sync feature-branch --dry-run
+#   gex sync --prune
+#
+# Options:
+#   --strategy=<merge|rebase> Sync strategy (default: merge)
+#   --all, -a                 Sync all branches with upstreams
+#   --prune, -p               Prune deleted remote branches
+#   --remote=<name>           Specific remote to sync with (default: auto-detect)
+#   --dry-run                 Preview operations without executing
+#   --force                   Override safety checks and warnings
+#   --no-fetch                Don't fetch from remote first
+#   --interactive, -i         Choose branches interactively
+#   -h, --help                Show usage
+#
+# Examples:
+#   gex sync                              # Update current branch with upstream
+#   gex sync --all                        # Update all branches with upstreams
+#   gex sync feature-branch               # Update specific branch
+#   gex sync --strategy=rebase            # Use rebase instead of merge
+#   gex sync --all --prune                # Update all branches and clean up
+#   gex sync --interactive                # Choose branches to update
+#   gex sync --dry-run                    # Preview what would happen
+#
+# Safety Features:
+#   - Requires clean working directory for current branch operations
+#   - Detects and warns about divergent branches
+#   - Shows detailed status before operations
+#   - Provides conflict resolution guidance
+#   - Protects against data loss scenarios
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GEX_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# shellcheck source=../lib/core.sh
+source "$GEX_ROOT/lib/core.sh"
+# shellcheck source=../lib/git.sh
+source "$GEX_ROOT/lib/git.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: gex sync [options] [branch...]
+
+Synchronize branches with their upstream tracking branches using smart defaults and safety checks.
+
+Options:
+  --strategy=<merge|rebase> Sync strategy (default: merge)
+  --all, -a                 Sync all branches with upstreams
+  --prune, -p               Prune deleted remote branches
+  --remote=<name>           Specific remote to sync with (default: auto-detect)
+  --dry-run                 Preview operations without executing
+  --force                   Override safety checks and warnings
+  --no-fetch                Don't fetch from remote first
+  --interactive, -i         Choose branches interactively
+  -h, --help                Show this help
+
+Arguments:
+  [branch...]               Specific branches to sync (default: current branch)
+
+Examples:
+  gex sync                              # Update current branch with upstream
+  gex sync --all                        # Update all branches with upstreams
+  gex sync feature-branch               # Update specific branch
+  gex sync --strategy=rebase            # Use rebase instead of merge
+  gex sync --all --prune                # Update all branches and clean up
+  gex sync --interactive                # Choose branches to update
+  gex sync --dry-run                    # Preview what would happen
+
+Strategies:
+  merge    - Merge upstream changes (preserves merge history)
+  rebase   - Rebase local commits on upstream (linear history)
+
+Safety Features:
+  - Automatically fetches latest remote state before operations
+  - Requires clean working directory for current branch operations
+  - Detects divergent branches and provides conflict guidance
+  - Shows detailed status and preview before executing operations
+  - Protects against accidental data loss
+
+Integration:
+  Works seamlessly with other gex commands:
+    gex start feature my-feature
+    # ... work on feature ...
+    gex sync                            # Keep up-to-date with main
+    gex publish                         # Push when ready
+
+Configuration:
+  Set defaults in ~/.config/gex/config or .gexrc:
+    sync_strategy = rebase              # Default strategy (merge|rebase)
+    sync_auto_prune = true              # Auto-prune during sync operations
+    sync_fetch_all = false              # Fetch all remotes vs just current
+    protected_branches = main,develop   # Skip these in --all operations
+EOF
+}
+
+# Require git repository
+gex_require_git_repo
+
+# -------------------------
+# Configuration & Defaults
+# -------------------------
+SYNC_STRATEGY="merge"
+SYNC_ALL=0
+SYNC_PRUNE=0
+SYNC_REMOTE=""
+DRY_RUN=0
+FORCE_SYNC=0
+NO_FETCH=0
+INTERACTIVE_MODE=0
+TARGET_BRANCHES=()
+AUTO_PRUNE=0
+FETCH_ALL=0
+PROTECTED_BRANCHES=("main" "master" "develop")
+
+# Load configuration
+load_config() {
+  if command -v gex_config_get >/dev/null 2>&1; then
+    local strategy
+    strategy="$(gex_config_get sync_strategy 2>/dev/null || echo "")"
+    if [ "${strategy:-}" = "rebase" ]; then
+      SYNC_STRATEGY="rebase"
+    fi
+
+    local auto_prune
+    auto_prune="$(gex_config_get sync_auto_prune 2>/dev/null || echo "")"
+    if [ "${auto_prune:-}" = "true" ]; then
+      AUTO_PRUNE=1
+    fi
+
+    local fetch_all
+    fetch_all="$(gex_config_get sync_fetch_all 2>/dev/null || echo "")"
+    if [ "${fetch_all:-}" = "true" ]; then
+      FETCH_ALL=1
+    fi
+
+    local protected
+    protected="$(gex_config_get protected_branches 2>/dev/null || echo "")"
+    if [ -n "$protected" ]; then
+      PROTECTED_BRANCHES=()
+      local oldIFS="$IFS"
+      IFS=','
+      for branch in $protected; do
+        branch="$(echo "$branch" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+        [ -n "$branch" ] && PROTECTED_BRANCHES+=("$branch")
+      done
+      IFS="$oldIFS"
+    fi
+  fi
+}
+
+# -------------------------
+# Parse Arguments
+# -------------------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --strategy=*) SYNC_STRATEGY="${1#--strategy=}";;
+    --strategy) shift; SYNC_STRATEGY="$1";;
+    --all|-a) SYNC_ALL=1;;
+    --prune|-p) SYNC_PRUNE=1;;
+    --remote=*) SYNC_REMOTE="${1#--remote=}";;
+    --remote) shift; SYNC_REMOTE="$1";;
+    --dry-run) DRY_RUN=1;;
+    --force) FORCE_SYNC=1;;
+    --no-fetch) NO_FETCH=1;;
+    --interactive|-i) INTERACTIVE_MODE=1;;
+    -h|--help) usage; exit 0;;
+    --) shift; break;;
+    -*) gex_die "Unknown option: $1";;
+    *) TARGET_BRANCHES+=("$1");;
+  esac
+  shift
+done
+
+# Add remaining arguments as target branches
+TARGET_BRANCHES+=("$@")
+
+# Load config after parsing arguments
+load_config
+
+# Validate strategy
+case "$SYNC_STRATEGY" in
+  merge|rebase) ;;
+  *) gex_die "Invalid strategy: $SYNC_STRATEGY. Use 'merge' or 'rebase'";;
+esac
+
+# -------------------------
+# Helper Functions
+# -------------------------
+
+# Get upstream branch for a given branch
+get_upstream_branch() {
+  local branch="$1"
+  git rev-parse --abbrev-ref "${branch}@{upstream}" 2>/dev/null || return 1
+}
+
+# Check if branch has upstream tracking
+has_upstream() {
+  local branch="$1"
+  get_upstream_branch "$branch" >/dev/null 2>&1
+}
+
+# Get divergence info between branch and upstream
+get_divergence() {
+  local branch="$1"
+  local upstream
+  upstream="$(get_upstream_branch "$branch")" || return 1
+
+  local ahead behind
+  ahead=$(git rev-list --count "$upstream..$branch" 2>/dev/null || echo "0")
+  behind=$(git rev-list --count "$branch..$upstream" 2>/dev/null || echo "0")
+
+  echo "$ahead $behind"
+}
+
+# Check if branch is protected
+is_protected_branch() {
+  local branch="$1"
+  local pattern
+  for pattern in "${PROTECTED_BRANCHES[@]}"; do
+    if gex_match_glob "$branch" "$pattern"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Get all branches with upstream tracking
+get_trackable_branches() {
+  local branches=()
+  while IFS= read -r branch; do
+    if has_upstream "$branch"; then
+      branches+=("$branch")
+    fi
+  done < <(gex_git_local_branches)
+  printf '%s\n' "${branches[@]}"
+}
+
+# Interactive branch selection
+interactive_select_branches() {
+  local available_branches
+  mapfile -t available_branches < <(get_trackable_branches)
+
+  if [ ${#available_branches[@]} -eq 0 ]; then
+    gex_die "No branches with upstream tracking found"
+  fi
+
+  gex_info "Select branches to sync:"
+  echo
+
+  local i=0
+  for branch in "${available_branches[@]}"; do
+    local upstream
+    upstream="$(get_upstream_branch "$branch")"
+    local divergence
+    divergence="$(get_divergence "$branch")"
+    local ahead="${divergence%% *}"
+    local behind="${divergence##* }"
+
+    printf "%2d: %-20s -> %-20s (ahead: %s, behind: %s)\n" \
+      "$i" "$branch" "$upstream" "$ahead" "$behind"
+    ((i++))
+  done
+
+  echo
+  echo -n "Enter branch numbers (e.g., 0,1,2 or 0-2): "
+  read -r selection
+
+  local selected=()
+  if [[ "$selection" =~ ^[0-9]+-[0-9]+$ ]]; then
+    # Range format: 0-2
+    local start="${selection%-*}"
+    local end="${selection#*-}"
+    for ((i=start; i<=end; i++)); do
+      if [ "$i" -lt "${#available_branches[@]}" ]; then
+        selected+=("${available_branches[$i]}")
+      fi
+    done
+  elif [[ "$selection" =~ ^[0-9,]+$ ]]; then
+    # Comma format: 0,1,2
+    local oldIFS="$IFS"
+    IFS=','
+    for num in $selection; do
+      if [ "$num" -lt "${#available_branches[@]}" ]; then
+        selected+=("${available_branches[$num]}")
+      fi
+    done
+    IFS="$oldIFS"
+  else
+    gex_die "Invalid selection format. Use ranges (0-2) or comma-separated (0,1,2)"
+  fi
+
+  if [ ${#selected[@]} -eq 0 ]; then
+    gex_die "No valid branches selected"
+  fi
+
+  printf '%s\n' "${selected[@]}"
+}
+
+# -------------------------
+# Fetch Operations
+# -------------------------
+
+perform_fetch() {
+  if [ $NO_FETCH -eq 1 ]; then
+    return 0
+  fi
+
+  gex_info "Fetching latest changes from remote(s)..."
+
+  if [ $FETCH_ALL -eq 1 ]; then
+    git fetch --all --prune >/dev/null 2>&1 || {
+      gex_warn "Failed to fetch from some remotes, continuing..."
+    }
+  elif [ -n "$SYNC_REMOTE" ]; then
+    git fetch "$SYNC_REMOTE" --prune >/dev/null 2>&1 || {
+      gex_die "Failed to fetch from remote: $SYNC_REMOTE"
+    }
+  else
+    # Fetch from all remotes that have tracking branches
+    git fetch --prune >/dev/null 2>&1 || {
+      gex_warn "Failed to fetch from default remote, continuing..."
+    }
+  fi
+
+  if [ $SYNC_PRUNE -eq 1 ] || [ $AUTO_PRUNE -eq 1 ]; then
+    gex_info "Pruning deleted remote branches..."
+    git remote prune origin >/dev/null 2>&1 || true
+  fi
+}
+
+# -------------------------
+# Sync Operations
+# -------------------------
+
+# Sync a single branch
+sync_branch() {
+  local branch="$1"
+  local current_branch
+  current_branch="$(gex_git_current_branch)"
+
+  # Get upstream info
+  local upstream
+  upstream="$(get_upstream_branch "$branch")" || {
+    gex_warn "Branch '$branch' has no upstream tracking, skipping"
+    return 1
+  }
+
+  # Get divergence
+  local divergence
+  divergence="$(get_divergence "$branch")"
+  local ahead="${divergence%% *}"
+  local behind="${divergence##* }"
+
+  # Skip if already up-to-date
+  if [ "$behind" -eq 0 ]; then
+    gex_info "Branch '$branch' is already up-to-date with '$upstream'"
+    return 0
+  fi
+
+  # Check for conflicts if we have local commits
+  if [ "$ahead" -gt 0 ] && [ "$behind" -gt 0 ]; then
+    gex_warn "Branch '$branch' has diverged from '$upstream' (ahead: $ahead, behind: $behind)"
+    if [ $FORCE_SYNC -eq 0 ]; then
+      gex_warn "This may result in conflicts. Use --force to proceed anyway."
+      echo "  Consider:"
+      echo "    gex sync $branch --strategy=rebase  # Rebase local commits"
+      echo "    gex sync $branch --strategy=merge   # Merge upstream changes"
+      echo "    gex sync $branch --force            # Force sync anyway"
+      return 1
+    fi
+  fi
+
+  # Switch to branch if not current
+  local switched=0
+  if [ "$branch" != "$current_branch" ]; then
+    if [ "$current_branch" = "$branch" ] || gex_git_is_clean; then
+      git checkout "$branch" >/dev/null 2>&1 || {
+        gex_error "Failed to checkout branch: $branch"
+        return 1
+      }
+      switched=1
+    else
+      gex_error "Cannot switch to '$branch': working directory not clean"
+      return 1
+    fi
+  fi
+
+  # Perform the sync
+  local success=0
+  case "$SYNC_STRATEGY" in
+    merge)
+      if git merge "$upstream" --no-edit >/dev/null 2>&1; then
+        success=1
+        gex_info "Successfully merged '$upstream' into '$branch'"
+      else
+        gex_error "Merge conflict in branch '$branch'"
+        echo "  To resolve:"
+        echo "    # Fix conflicts in the listed files"
+        echo "    git add <resolved-files>"
+        echo "    git commit"
+        echo "  To abort:"
+        echo "    git merge --abort"
+      fi
+      ;;
+    rebase)
+      if git rebase "$upstream" >/dev/null 2>&1; then
+        success=1
+        gex_info "Successfully rebased '$branch' onto '$upstream'"
+      else
+        gex_error "Rebase conflict in branch '$branch'"
+        echo "  To resolve:"
+        echo "    # Fix conflicts in the listed files"
+        echo "    git add <resolved-files>"
+        echo "    git rebase --continue"
+        echo "  To abort:"
+        echo "    git rebase --abort"
+      fi
+      ;;
+  esac
+
+  # Switch back to original branch if we switched
+  if [ $switched -eq 1 ] && [ $success -eq 1 ]; then
+    git checkout "$current_branch" >/dev/null 2>&1 || {
+      gex_warn "Could not switch back to original branch: $current_branch"
+    }
+  fi
+
+  return $((1 - success))
+}
+
+# -------------------------
+# Status Display
+# -------------------------
+
+show_sync_plan() {
+  local branches=("$@")
+
+  echo "Sync Plan:"
+  echo "  Strategy:       $SYNC_STRATEGY"
+  echo "  Branches:       ${#branches[@]}"
+  if [ $SYNC_PRUNE -eq 1 ] || [ $AUTO_PRUNE -eq 1 ]; then
+    echo "  Prune remotes:  yes"
+  fi
+  echo
+
+  echo "Branch Status:"
+  for branch in "${branches[@]}"; do
+    local upstream
+    upstream="$(get_upstream_branch "$branch")" || {
+      printf "  %-20s: no upstream tracking\n" "$branch"
+      continue
+    }
+
+    local divergence
+    divergence="$(get_divergence "$branch")"
+    local ahead="${divergence%% *}"
+    local behind="${divergence##* }"
+
+    if [ "$behind" -eq 0 ]; then
+      printf "  %-20s: up-to-date with %s\n" "$branch" "$upstream"
+    elif [ "$ahead" -eq 0 ]; then
+      printf "  %-20s: %s commits behind %s\n" "$branch" "$behind" "$upstream"
+    else
+      printf "  %-20s: %s ahead, %s behind %s (diverged)\n" "$branch" "$ahead" "$behind" "$upstream"
+    fi
+  done
+  echo
+}
+
+# -------------------------
+# Main Logic
+# -------------------------
+
+# Determine which branches to sync
+if [ $INTERACTIVE_MODE -eq 1 ]; then
+  mapfile -t TARGET_BRANCHES < <(interactive_select_branches)
+elif [ $SYNC_ALL -eq 1 ]; then
+  mapfile -t TARGET_BRANCHES < <(get_trackable_branches)
+elif [ ${#TARGET_BRANCHES[@]} -eq 0 ]; then
+  # Default: current branch
+  current_branch="$(gex_git_current_branch)"
+  [ -n "$current_branch" ] || gex_die "Could not determine current branch"
+  TARGET_BRANCHES=("$current_branch")
+fi
+
+# Validate branches
+validated_branches=()
+for branch in "${TARGET_BRANCHES[@]}"; do
+  if ! git show-ref --verify --quiet "refs/heads/$branch"; then
+    gex_warn "Branch '$branch' does not exist, skipping"
+    continue
+  fi
+
+  if ! has_upstream "$branch"; then
+    gex_warn "Branch '$branch' has no upstream tracking, skipping"
+    continue
+  fi
+
+  # Skip protected branches in --all mode unless explicitly specified
+  if [ $SYNC_ALL -eq 1 ] && is_protected_branch "$branch"; then
+    gex_debug "Skipping protected branch: $branch"
+    continue
+  fi
+
+  validated_branches+=("$branch")
+done
+
+if [ ${#validated_branches[@]} -eq 0 ]; then
+  gex_die "No valid branches to sync"
+fi
+
+# Check working directory if syncing current branch
+current_branch="$(gex_git_current_branch)"
+if [[ " ${validated_branches[*]} " =~ " $current_branch " ]] && ! gex_git_is_clean; then
+  if [ $FORCE_SYNC -eq 0 ]; then
+    gex_die "Working directory must be clean to sync current branch. Commit or stash changes first."
+  else
+    gex_warn "Working directory not clean, but proceeding with --force"
+  fi
+fi
+
+# Fetch latest changes
+perform_fetch
+
+# Show sync plan
+show_sync_plan "${validated_branches[@]}"
+
+if [ $DRY_RUN -eq 1 ]; then
+  echo "DRY RUN - Would execute:"
+  for branch in "${validated_branches[@]}"; do
+    local upstream
+    upstream="$(get_upstream_branch "$branch")"
+    echo "  git checkout $branch && git $SYNC_STRATEGY $upstream"
+  done
+  if [ $SYNC_PRUNE -eq 1 ] || [ $AUTO_PRUNE -eq 1 ]; then
+    echo "  git remote prune origin"
+  fi
+  echo
+  echo "This would sync ${#validated_branches[@]} branch(es)."
+  exit 0
+fi
+
+# Confirm with user if not in force mode
+if [ $FORCE_SYNC -eq 0 ] && [ ${#validated_branches[@]} -gt 1 ]; then
+  echo -n "Proceed with syncing ${#validated_branches[@]} branches? [y/N] "
+  read -r confirm
+  case "$confirm" in
+    [yY]|[yY][eE][sS]) ;;
+    *) gex_die "Aborted by user";;
+  esac
+fi
+
+# Execute sync operations
+success_count=0
+failure_count=0
+
+for branch in "${validated_branches[@]}"; do
+  if sync_branch "$branch"; then
+    ((success_count++))
+  else
+    ((failure_count++))
+  fi
+done
+
+# Summary
+echo
+if [ $failure_count -eq 0 ]; then
+  gex_info "Successfully synced $success_count branch(es)!"
+else
+  gex_warn "Synced $success_count branch(es), $failure_count failed"
+  echo
+  echo "Failed branches may have conflicts that need manual resolution."
+  echo "See the guidance above for resolving conflicts."
+fi
+
+# Show next steps
+if [ $success_count -gt 0 ]; then
+  echo
+  echo "Next steps:"
+  echo "  # Continue working on your branches"
+  echo "  git add . && git commit -m \"your changes\""
+  echo "  gex publish  # Push when ready"
+  echo
+  echo "  # Keep branches up-to-date regularly:"
+  echo "  gex sync --all  # Update all branches"
+fi
+
+# Exit with appropriate code
+[ $failure_count -eq 0 ] || exit 1
+
+# End of sync command
