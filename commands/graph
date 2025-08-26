@@ -292,7 +292,7 @@ apply_highlight() {
     cat
   else
     # Bold magenta for matched decoration block
-    sed -E "s/(\(.*($HIGHLIGHT_REGEX).*?\))/$(printf '\033[1;35m')\1$(printf '\033[0m')/g"
+    sed -E "s/(\([^)]*($HIGHLIGHT_REGEX)[^)]*\))/$(printf '\033[1;35m')\1$(printf '\033[0m')/g"
   fi
 }
 
