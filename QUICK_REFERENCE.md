@@ -10,6 +10,7 @@ gex start <type> <name>           # Create branch with naming conventions
 gex publish                       # Push with upstream tracking & safety checks
 gex snip                          # Cherry-pick to avoid rebase conflicts
 gex squash --count=N              # Squash last N commits into one
+gex sync                          # Update current branch with upstream
 ```
 
 ### Commit Management
@@ -19,6 +20,8 @@ gex wip --undo                    # Rollback last WIP commit
 gex wip --list                    # Show WIP history
 gex squash                        # Squash unpushed commits
 gex squash --interactive          # Choose commits to squash
+gex sync --all                    # Update all branches with upstreams
+gex sync --strategy=rebase        # Use rebase instead of merge
 ```
 
 ### Visualization
@@ -42,9 +45,9 @@ gex config list                   # Show current config
 gex start feature user-auth       # Create: feature/user-auth
 # ... develop ...
 gex wip "checkpoint"              # Quick save
+gex sync --strategy=rebase        # Keep up-to-date with main
 gex squash --count=3              # Clean up commit history
 gex publish --force-with-lease    # Push with upstream
-gex snip --onto=main              # Avoid rebase conflicts
 ```
 
 ### Hotfix
@@ -106,6 +109,16 @@ git reset --hard HEAD~1           # Undo last regular commit
 --onto=COMMIT           # Squash onto specific commit
 --force                 # Allow squashing pushed commits
 --dry-run              # Preview operation
+```
+
+### sync
+```bash
+--strategy=<merge|rebase> # Sync strategy (default: merge)
+--all, -a              # Sync all branches with upstreams  
+--prune, -p            # Prune deleted remote branches
+--remote=<name>        # Specific remote to sync with
+--interactive, -i      # Choose branches interactively
+--dry-run             # Preview operations
 ```
 
 ### wip

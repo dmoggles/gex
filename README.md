@@ -4,7 +4,7 @@ A lightweight, extensible command-line tool that enhances Git workflows with int
 
 **gex** provides high-level commands that wrap common Git operations, making complex workflows simple and safe while preserving the full power of Git underneath.
 
-> **Status**: Production ready. Core commands: `graph`, `start`, `publish`, `snip`, `squash`, `wip`, `config`
+> **Status**: Production ready. Core commands: `graph`, `start`, `publish`, `snip`, `squash`, `sync`, `wip`, `config`
 
 ---
 
@@ -19,6 +19,7 @@ A lightweight, extensible command-line tool that enhances Git workflows with int
   - [publish - Push branches safely](#publish)
   - [snip - Cherry-pick to avoid conflicts](#snip)
   - [squash - Combine multiple commits](#squash)
+  - [sync - Synchronize with upstream branches](#sync)
   - [wip - Quick work-in-progress commits](#wip)
   - [config - Manage configuration](#config)
 - [Configuration](#configuration)
@@ -149,7 +150,20 @@ gex squash --count=4 -m "Implement user validation feature"
 gex publish --force-with-lease
 ```
 
-### 4. Avoiding Rebase Conflicts
+### 4. Staying Up-to-Date with Upstream
+
+```bash
+# Keep your feature branch synchronized with main
+gex sync --strategy=rebase           # Rebase local commits on latest main
+
+# Update all your branches at once  
+gex sync --all                       # Merge upstream changes into all branches
+
+# Preview what would be updated
+gex sync --all --dry-run             # See status without making changes
+```
+
+### 5. Avoiding Rebase Conflicts
 
 ```bash
 # Your branch diverged from main with potential conflicts
@@ -664,6 +678,168 @@ Set defaults in `~/.config/gex/config` or `.gexrc`:
 ```ini
 squash_unpushed_only = true     # Only squash unpushed commits
 squash_preserve_merges = false  # Don't preserve merge commits
+```
+
+---
+
+## sync
+
+**Synchronize branches with their upstream tracking branches using smart defaults and safety checks.**
+
+The `sync` command provides a comprehensive solution for keeping local branches up-to-date with upstream changes, supporting both single branch and bulk operations with intelligent conflict detection.
+
+### Syntax
+```bash
+gex sync [options] [branch...]
+```
+
+### Key Features
+- **Flexible strategies**: Choose between merge and rebase for different workflows
+- **Bulk operations**: Update all branches with upstream tracking at once
+- **Smart detection**: Auto-detects divergent branches and provides guidance
+- **Interactive selection**: Choose specific branches to update from a list
+- **Remote maintenance**: Prune stale remote references during sync
+- **Safety first**: Requires clean working directory and shows detailed previews
+
+### The Problem Solved
+
+```
+Before:    feature-branch      main (upstream)
+           |                   |
+           A---B---C           A---D---E---F (new commits)
+           (out of date)
+
+After:     feature-branch
+           |
+           A---D---E---F---B'---C' (rebased, up-to-date)
+```
+
+### Options
+
+| Option | Description | Example |
+|--------|-------------|---------|
+| `--strategy=<merge\|rebase>` | Sync strategy | `--strategy=rebase` |
+| `--all`, `-a` | Sync all branches with upstreams | `--all` |
+| `--prune`, `-p` | Prune deleted remote branches | `--prune` |
+| `--remote=<name>` | Specific remote to sync with | `--remote=upstream` |
+| `--dry-run` | Preview operations | `--dry-run` |
+| `--force` | Override safety checks | `--force` |
+| `--no-fetch` | Skip fetching from remote | `--no-fetch` |
+| `--interactive`, `-i` | Choose branches interactively | `--interactive` |
+
+### Examples
+
+```bash
+# Update current branch with upstream
+gex sync
+
+# Update all branches with their upstreams
+gex sync --all
+
+# Use rebase strategy for linear history
+gex sync --strategy=rebase
+
+# Update specific branch
+gex sync feature-branch
+
+# Interactive selection of branches
+gex sync --interactive
+
+# Update all branches and clean up stale references
+gex sync --all --prune
+
+# Preview what would happen
+gex sync --all --dry-run
+```
+
+### Strategies
+
+**Merge Strategy (default):**
+- Preserves branch history with merge commits
+- Safer for shared branches
+- Shows clear integration points
+
+**Rebase Strategy:**
+- Creates linear history
+- Cleaner commit graph
+- Rewrites local commits (use with caution on shared branches)
+
+### Safety Features
+
+**Clean Working Directory:**
+```bash
+gex sync
+# ERROR: Working directory must be clean to sync current branch.
+# Commit or stash changes first.
+```
+
+**Divergent Branch Detection:**
+```bash
+gex sync feature-branch
+# WARN: Branch 'feature-branch' has diverged from 'origin/main' (ahead: 2, behind: 3)
+# This may result in conflicts. Use --force to proceed anyway.
+#   Consider:
+#     gex sync feature-branch --strategy=rebase  # Rebase local commits
+#     gex sync feature-branch --strategy=merge   # Merge upstream changes
+```
+
+**Detailed Preview:**
+```bash
+gex sync --all --dry-run
+# Sync Plan:
+#   Strategy:       merge
+#   Branches:       3
+#   Prune remotes:  yes
+# 
+# Branch Status:
+#   main                : up-to-date with origin/main
+#   feature-auth        : 2 commits behind origin/feature-auth
+#   bugfix-login        : 1 ahead, 1 behind origin/main (diverged)
+# 
+# DRY RUN - Would execute:
+#   git checkout feature-auth && git merge origin/feature-auth
+#   git checkout bugfix-login && git merge origin/main
+#   git remote prune origin
+```
+
+### Protected Branches
+
+By default, protected branches (main, master, develop) are skipped in `--all` operations:
+
+```bash
+gex sync --all          # Skips main/master/develop
+gex sync main           # Explicitly sync main (allowed)
+```
+
+### Integration Workflow
+
+```bash
+# Start feature work
+gex start feature user-profile
+
+# Work on feature...
+git add . && git commit -m "Add user profile page"
+
+# Keep up-to-date with main
+gex sync --strategy=rebase
+
+# Continue work...
+git add . && git commit -m "Add profile validation"
+
+# Final sync before publishing
+gex sync
+gex publish
+```
+
+### Configuration
+
+Set defaults in `~/.config/gex/config` or `.gexrc`:
+
+```ini
+sync_strategy = rebase              # Default strategy (merge|rebase)
+sync_auto_prune = true              # Auto-prune during sync operations
+sync_fetch_all = false              # Fetch all remotes vs just current
+protected_branches = main,develop   # Skip these in --all operations
 ```
 
 ---

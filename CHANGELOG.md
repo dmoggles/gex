@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Force-push integration warnings
   - Configuration support for default behavior
 
+- **`gex sync`** - Smart branch synchronization with upstream tracking
+  - Update current branch or multiple branches with upstream changes
+  - Support for merge and rebase strategies (`--strategy=merge|rebase`)
+  - Bulk operations across all branches with upstream tracking (`--all`)
+  - Interactive branch selection (`--interactive`)
+  - Remote pruning to clean up stale references (`--prune`)
+  - Comprehensive safety checks (clean working directory, divergent branch detection)
+  - Protected branch handling in bulk operations
+  - Dry-run mode for previewing operations
+  - Configuration support for default strategies and behaviors
+
 ## [1.0.0] - 2024-08-24
 
 ### Major Release - Production Ready
