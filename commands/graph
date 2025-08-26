@@ -101,10 +101,16 @@ SHOW_REMOTE_LABELS=0
 parse_csv_into_array() {
   local ref="$1"; shift
   local raw="$1"
-  local -n _arr_ref="$ref"
+  local items
   IFS=',' read -r -a items <<<"$raw"
   for it in "${items[@]}"; do
-    [ -n "$it" ] && _arr_ref+=("$it")
+    if [ -n "$it" ]; then
+      case "$ref" in
+        BRANCH_PATTERNS) BRANCH_PATTERNS+=("$it");;
+        EXCLUDE_PATTERNS) EXCLUDE_PATTERNS+=("$it");;
+        HIGHLIGHT_PATTERNS) HIGHLIGHT_PATTERNS+=("$it");;
+      esac
+    fi
   done
 }
 
