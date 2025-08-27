@@ -1,0 +1,1124 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# gex/commands/worktree
+#
+# Phase 1 implementation of the "gex worktree" workflow.
+#
+# Features delivered (Phase 1 scope):
+#   - list        : Enumerate git worktrees with metadata (ephemeral, TTL, dirty, ahead/behind)
+#   - add         : Add an existing branch into a new worktree (optionally ephemeral)
+#   - create      : Create a new branch in a new worktree (optionally ephemeral)
+#   - ephemeral   : Convenience wrapper to create an ephemeral worktree + branch with TTL
+#   - prune       : Remove (dry-run by default) worktrees (filters: ephemeral-only / expired-only)
+#   - TTL pre-clean hook: On any subcommand invocation, expired ephemeral worktrees can be auto-removed
+#
+# Decisions (locked in earlier discussion):
+#   - Metadata file location: <repo-root>/.gex/worktrees.json
+#   - Ephemeral worktrees create a branch by default (not detached)
+#   - prune defaults to dry-run
+#   - TTL expired ephemeral worktrees detected on each command; auto-delete modes: prompt|force|off
+#   - JSON output uses camelCase keys
+#
+# Portability notes:
+#   - Avoids associative arrays for macOS default bash (3.x) compatibility
+#   - Limited JSON parsing (best-effort); malformed metadata file will be ignored with a warning
+#   - Time parsing complexity avoided by storing both RFC3339 and epoch (createdEpoch) on creation
+#
+# JSON Metadata Structure (stored):
+# {
+#   "version": 1,
+#   "worktrees": {
+#     "/abs/path/one": {
+#       "branch": "main",
+#       "created": "2025-09-02T09:10:11Z",
+#       "createdEpoch": 1756813811,
+#       "ephemeral": false
+#     },
+#     "/abs/path/wt-x": {
+#       "branch": "wt/20250902-a1",
+#       "created": "2025-09-02T09:10:11Z",
+#       "createdEpoch": 1756813811,
+#       "ephemeral": true,
+#       "ttlHours": 72,
+#       "baseRef": "origin/main",
+#       "source": "ephemeral"
+#     }
+#   }
+# }
+#
+# Internal representation (WT_META_ENTRIES variable):
+#   Each line: path<TAB>branch<TAB>created<TAB>createdEpoch<TAB>ephemeral<TAB>ttlHours<TAB>baseRef<TAB>source
+#   Unused / absent fields are empty.
+#
+# Exit codes:
+#   0 success
+#   1 general error
+#   2 usage / validation error
+#
+# -----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# Source core library (color, logging, config). Fallback to minimal stubs if unavailable.
+if [ -f "$(dirname "$0")/../lib/core.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$(dirname "$0")/../lib/core.sh"
+else
+  gex_die() { echo "ERROR: $*" >&2; exit 1; }
+  gex_warn() { echo "WARN: $*" >&2; }
+  gex_info() { echo "INFO: $*" >&2; }
+  gex_debug() { :; }
+  gex_config_get() { return 1; }
+fi
+
+# -----------------------------------------------------------------------------
+# Utility: repo root & metadata paths
+# -----------------------------------------------------------------------------
+_wt_repo_root() {
+  git rev-parse --show-toplevel 2>/dev/null || gex_die "Not inside a git repository."
+}
+
+_wt_metadata_dir() {
+  local root
+  root="$(_wt_repo_root)"
+  echo "$root/.gex"
+}
+
+_wt_metadata_file() {
+  local dir
+  dir="$(_wt_metadata_dir)"
+  echo "$dir/worktrees.json"
+}
+
+# -----------------------------------------------------------------------------
+# Time helpers
+# -----------------------------------------------------------------------------
+_wt_now_epoch() { date -u +%s; }
+_wt_now_rfc3339() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+# -----------------------------------------------------------------------------
+# Configuration helpers (with defaults)
+# -----------------------------------------------------------------------------
+_wt_cfg_default_ttl() {
+  local val
+  if val=$(gex_config_get gex.worktree.defaultTtlHours 2>/dev/null); then
+    [ -n "$val" ] && echo "$val" && return
+  fi
+  echo "72"
+}
+
+_wt_cfg_auto_delete_mode() {
+  local val
+  if val=$(gex_config_get gex.worktree.ttl.autoDelete 2>/dev/null); then
+    case "$val" in
+      prompt|force|off) echo "$val"; return;;
+      *) ;;
+    esac
+  fi
+  echo "prompt"
+}
+
+_wt_cfg_ephemeral_prefix() {
+  local val
+  if val=$(gex_config_get gex.worktree.ephemeralPrefix 2>/dev/null); then
+    [ -n "$val" ] && echo "$val" && return
+  fi
+  echo "wt"
+}
+
+# -----------------------------------------------------------------------------
+# Metadata loading / saving
+# -----------------------------------------------------------------------------
+WT_META_ENTRIES="" # newline-delimited records (see format above)
+WT_META_VERSION=1
+
+_wt_reset_metadata() {
+  WT_META_ENTRIES=""
+}
+
+# Parse minimal JSON (best effort). If malformed, we warn and ignore.
+_wt_load_metadata() {
+  _wt_reset_metadata
+  local file
+  file="$(_wt_metadata_file)"
+  [ -f "$file" ] || return 0
+
+  local line path in_entry branch created createdEpoch ephemeral ttlHours baseRef source
+  in_entry=0
+  while IFS= read -r line; do
+    # Detect path entry start: "  "/abs/path": {
+    if echo "$line" | grep -Eq '^[[:space:]]*"/[^"]+"[[:space:]]*:[[:space:]]*{$'; then
+      path=$(printf '%s\n' "$line" | sed -E -n 's/^[[:space:]]*"([^"]+)".*/\1/p')
+      in_entry=1
+      branch=""; created=""; createdEpoch=""; ephemeral=""; ttlHours=""; baseRef=""; source=""
+      continue
+    fi
+    if [ "$in_entry" = "1" ]; then
+      # Key-value lines up to ending }
+      if [[ "$line" =~ ^[[:space:]]*\}[,]?[[:space:]]*$ ]]; then
+        # End of entry
+        in_entry=0
+        # Append record
+        WT_META_ENTRIES+="${path}"$'\t'"${branch}"$'\t'"${created}"$'\t'"${createdEpoch}"$'\t'"${ephemeral}"$'\t'"${ttlHours}"$'\t'"${baseRef}"$'\t'"${source}"$'\n'
+        continue
+      fi
+      # Match "key": value (value may be "string", number, true/false)
+      if [[ "$line" =~ \"([a-zA-Z0-9]+)\"[[:space:]]*:[[:space:]]*(.+)[,]?[[:space:]]*$ ]]; then
+        local k="${BASH_REMATCH[1]}"
+        local raw="${BASH_REMATCH[2]}"
+        # Trim quotes for strings
+        if [[ "$raw" =~ ^\"(.*)\"$ ]]; then
+          raw="${BASH_REMATCH[1]}"
+        fi
+        case "$k" in
+          branch) branch="$raw";;
+          created) created="$raw";;
+          createdEpoch) createdEpoch="$raw";;
+          ephemeral) ephemeral="$raw";;
+          ttlHours) ttlHours="$raw";;
+          baseRef) baseRef="$raw";;
+          source) source="$raw";;
+          *) ;;
+        esac
+      fi
+    fi
+  done < "$file"
+}
+
+_wt_save_metadata() {
+  local file dir
+  file="$(_wt_metadata_file)"
+  dir="$(_wt_metadata_dir)"
+  mkdir -p "$dir"
+  {
+    echo "{"
+    echo "  \"version\": $WT_META_VERSION,"
+    echo "  \"worktrees\": {"
+    local first=1
+    local IFS=$'\n'
+    for rec in $WT_META_ENTRIES; do
+      [ -n "$rec" ] || continue
+      IFS=$'\t' read -r path branch created createdEpoch ephemeral ttlHours baseRef source <<<"$rec"
+      [ -n "$path" ] || continue
+      [ "$first" = "1" ] || echo ","
+      first=0
+      echo "    \"${path}\": {"
+      echo "      \"branch\": \"${branch}\""
+      [ -n "$created" ] && echo "      ,\"created\": \"${created}\""
+      [ -n "$createdEpoch" ] && echo "      ,\"createdEpoch\": ${createdEpoch}"
+      if [ "$ephemeral" = "true" ]; then
+        echo "      ,\"ephemeral\": true"
+      else
+        echo "      ,\"ephemeral\": false"
+      fi
+      [ -n "$ttlHours" ] && echo "      ,\"ttlHours\": ${ttlHours}"
+      [ -n "$baseRef" ] && echo "      ,\"baseRef\": \"${baseRef}\""
+      [ -n "$source" ] && echo "      ,\"source\": \"${source}\""
+      echo -n "    }"
+    done
+    echo
+    echo "  }"
+    echo "}"
+  } > "$file.tmp.$$"
+  mv "$file.tmp.$$" "$file"
+}
+
+_wt_find_entry_line() {
+  # Returns the line (record) for path
+  local search="$1"
+  local IFS=$'\n'
+  for rec in $WT_META_ENTRIES; do
+    [ -n "$rec" ] || continue
+    local p
+    p="${rec%%$'\t'*}"
+    if [ "$p" = "$search" ]; then
+      echo "$rec"
+      return 0
+    fi
+  done
+  return 1
+}
+
+_wt_remove_entry() {
+  local remove_path="$1"
+  local new=""
+  local IFS=$'\n'
+  for rec in $WT_META_ENTRIES; do
+    [ -n "$rec" ] || continue
+    local p="${rec%%$'\t'*}"
+    [ "$p" = "$remove_path" ] && continue
+    new+="$rec"$'\n'
+  done
+  WT_META_ENTRIES="$new"
+}
+
+_wt_upsert_entry() {
+  # Replace or add
+  local path="$1" branch="$2" created="$3" createdEpoch="$4" ephemeral="$5" ttlHours="$6" baseRef="$7" source="$8"
+  _wt_remove_entry "$path"
+  WT_META_ENTRIES+="${path}"$'\t'"${branch}"$'\t'"${created}"$'\t'"${createdEpoch}"$'\t'"${ephemeral}"$'\t'"${ttlHours}"$'\t'"${baseRef}"$'\t'"${source}"$'\n'
+}
+
+_wt_is_ephemeral() {
+  local rec
+  rec="$(_wt_find_entry_line "$1" || true)"
+  [ -n "$rec" ] || return 1
+  IFS=$'\t' read -r _ _ _ _ ephemeral _ _ _ <<<"$rec"
+  [ "$ephemeral" = "true" ]
+}
+
+_wt_entry_field() {
+  # field name param
+  local path="$1" field="$2"
+  local rec="$(_wt_find_entry_line "$path" || true)"
+  [ -n "$rec" ] || return 1
+  IFS=$'\t' read -r _ branch created createdEpoch ephemeral ttlHours baseRef source <<<"$rec"
+  case "$field" in
+    branch) echo "$branch";;
+    created) echo "$created";;
+    createdEpoch) echo "$createdEpoch";;
+    ephemeral) echo "$ephemeral";;
+    ttlHours) echo "$ttlHours";;
+    baseRef) echo "$baseRef";;
+    source) echo "$source";;
+    *) return 1;;
+  esac
+}
+
+# -----------------------------------------------------------------------------
+# Git worktree discovery (authoritative)
+# -----------------------------------------------------------------------------
+# Produces lines: path<TAB>branch_or_detached
+_wt_discover_git_worktrees() {
+  git worktree list --porcelain | awk '
+    /^worktree / { path=$2 }
+    /^branch / { branch=$2 }
+    /^$/ {
+      if (path != "") {
+        if (branch == "") branch="(detached)"
+        print path "\t" branch
+      }
+      path=""; branch=""
+    }
+    END {
+      if (path != "") {
+        if (branch == "") branch="(detached)"
+        print path "\t" branch
+      }
+    }
+  '
+}
+
+# -----------------------------------------------------------------------------
+# Status / ahead-behind helpers
+# -----------------------------------------------------------------------------
+_wt_is_dirty() {
+  local path="$1"
+  if [ -n "$(git -C "$path" status --porcelain 2>/dev/null || true)" ]; then
+    return 0
+  fi
+  return 1
+}
+
+_wt_ahead_behind() {
+  # Prints "ahead behind" or empty if no upstream
+  local path="$1"
+  local upstream
+  upstream="$(git -C "$path" rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null || true)"
+  [ -n "$upstream" ] || return 1
+  local counts
+  counts="$(git -C "$path" rev-list --left-right --count "${upstream}...HEAD" 2>/dev/null || true)"
+  # counts like: "behind ahead" because --left-right prints left(right?), verify:
+  # Actually: --left-right --count A...B -> outputs "left right"
+  # Left = commits only in first (upstream), Right = only in second (HEAD)
+  # So behind = left, ahead = right
+  local left right
+  left="${counts%% *}"
+  right="${counts##* }"
+  [ -n "$left" ] || left=0
+  [ -n "$right" ] || right=0
+  echo "${right} ${left}"
+}
+
+# -----------------------------------------------------------------------------
+# TTL / expiration
+# -----------------------------------------------------------------------------
+_wt_is_expired() {
+  local path="$1"
+  local ephemeral ttl createdEpoch now
+  ephemeral="$(_wt_entry_field "$path" ephemeral 2>/dev/null || true)"
+  [ "$ephemeral" = "true" ] || return 1
+  ttl="$(_wt_entry_field "$path" ttlHours 2>/dev/null || true)"
+  [ -n "$ttl" ] || return 1
+  createdEpoch="$(_wt_entry_field "$path" createdEpoch 2>/dev/null || true)"
+  [ -n "$createdEpoch" ] || return 1
+  now="$(_wt_now_epoch)"
+  local expire=$(( createdEpoch + ttl * 3600 ))
+  [ "$now" -ge "$expire" ]
+}
+
+# -----------------------------------------------------------------------------
+# TTL auto-clean (prompt/force/off)
+# -----------------------------------------------------------------------------
+_wt_ttl_autoclean() {
+  local mode="$(_wt_cfg_auto_delete_mode)"
+  [ "$mode" = "off" ] && return 0
+
+  local discovered expired_list safe_to_remove=() skip_list=()
+  discovered="$(_wt_discover_git_worktrees)"
+  local IFS=$'\n'
+  for line in $discovered; do
+    [ -n "$line" ] || continue
+    local path branch
+    path="${line%%$'\t'*}"
+    branch="${line##*$'\t'}"
+    # Skip root repository path only if branch likely main? Actually we never remove root.
+    local repo_root
+    repo_root="$(_wt_repo_root)"
+    if [ "$path" = "$repo_root" ]; then
+      continue
+    fi
+    if _wt_is_expired "$path"; then
+      # Determine if safe (clean + not ahead)
+      local dirty=0 ahead=0 behind=0
+      if _wt_is_dirty "$path"; then dirty=1; fi
+      if ab="$(_wt_ahead_behind "$path" 2>/dev/null || true)"; then
+        ahead="${ab%% *}"
+        behind="${ab##* }"
+      fi
+      if [ "$dirty" = "0" ] && [ "${ahead:-0}" = "0" ]; then
+        safe_to_remove+=("$path")
+      else
+        skip_list+=("$path")
+      fi
+    fi
+  done
+
+  [ "${#safe_to_remove[@]}" -eq 0 ] && return 0
+
+  if [ "$mode" = "prompt" ]; then
+    echo "Expired ephemeral worktrees detected (${#safe_to_remove[@]} safe):" >&2
+    local p
+    for p in "${safe_to_remove[@]}"; do
+      local ttl createdEpoch ttlHours created
+      ttlHours="$(_wt_entry_field "$p" ttlHours 2>/dev/null || true)"
+      created="$(_wt_entry_field "$p" created 2>/dev/null || true)"
+      createdEpoch="$(_wt_entry_field "$p" createdEpoch 2>/dev/null || true)"
+      local now="$(_wt_now_epoch)"
+      local ageHours=$(( (now - createdEpoch)/3600 ))
+      echo "  $p  (age ${ageHours}h ttl ${ttlHours}h)" >&2
+    done
+    echo -n "Remove these expired ephemeral worktrees now? [y/N]: " >&2
+    local answer="n"
+    # Read from terminal if possible
+    if [ -t 0 ]; then
+      read -r answer || true
+    else
+      answer="n"
+    fi
+    case "$answer" in
+      y|Y|yes|YES) ;;
+      *) return 0;;
+    esac
+  fi
+
+  # Perform deletions
+  local del
+  for del in "${safe_to_remove[@]}"; do
+    if [ -d "$del" ]; then
+      rm -rf "$del" || { gex_warn "Failed to remove expired worktree path: $del"; continue; }
+      gex_info "Removed expired ephemeral worktree: $del"
+    fi
+    _wt_remove_entry "$del"
+  done
+
+  # Clean internal git refs (harmless if nothing pending)
+  git worktree prune >/dev/null 2>&1 || true
+
+  _wt_save_metadata
+}
+
+# -----------------------------------------------------------------------------
+# Ephemeral naming
+# -----------------------------------------------------------------------------
+_wt_random_suffix() {
+  # 5 char base36-ish
+  tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c 5 || echo "rnd$$"
+}
+
+_wt_generate_ephemeral_name() {
+  local prefix
+  prefix="$(_wt_cfg_ephemeral_prefix)"
+  local date_part
+  date_part="$(date -u +%Y%m%d)"
+  echo "${prefix}/${date_part}-$( _wt_random_suffix )"
+}
+
+# -----------------------------------------------------------------------------
+# TTL parsing
+# Accept forms:
+#   72          (hours)
+#   72h         (hours)
+#   2d          (days * 24)
+#   90m         (minutes -> rounded up to hour if remainder)
+# Falls back to default TTL if invalid.
+# -----------------------------------------------------------------------------
+_wt_parse_ttl_hours() {
+  local raw="$1"
+  [ -n "$raw" ] || { echo "$(_wt_cfg_default_ttl)"; return; }
+  if [[ "$raw" =~ ^([0-9]+)$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return
+  fi
+  if [[ "$raw" =~ ^([0-9]+)[Hh]$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return
+  fi
+  if [[ "$raw" =~ ^([0-9]+)[Dd]$ ]]; then
+    echo $(( ${BASH_REMATCH[1]} * 24 ))
+    return
+  fi
+  if [[ "$raw" =~ ^([0-9]+)[Mm]$ ]]; then
+    local mins="${BASH_REMATCH[1]}"
+    local hours=$(( (mins + 59)/60 ))
+    [ "$hours" -eq 0 ] && hours=1
+    echo "$hours"
+    return
+  fi
+  # Fallback
+  echo "$(_wt_cfg_default_ttl)"
+}
+
+# -----------------------------------------------------------------------------
+# Command: list
+# -----------------------------------------------------------------------------
+_wt_cmd_list() {
+  local json=0 show_expired=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift;;
+      --show-expired) show_expired=1; shift;;
+      -h|--help)
+        cat <<EOF
+Usage: gex worktree list [--json] [--show-expired]
+
+List git worktrees with gex metadata.
+
+Options:
+  --json          Output machine-readable JSON
+  --show-expired  Show expired ephemeral worktrees (flagged e!)
+  -h, --help      Show this help
+
+Legend:
+  * dirty
+  e ephemeral
+  ! expired (still present)
+EOF
+        return 0
+        ;;
+      *) gex_die "Unknown option for list: $1";;
+    esac
+  done
+
+  local repo_root
+  repo_root="$(_wt_repo_root)"
+
+  local discovered
+  discovered="$(_wt_discover_git_worktrees)"
+
+  if [ "$json" = "1" ]; then
+    echo "{\"worktrees\":["
+  else
+    printf "%-15s %-5s %-9s %-5s %-6s %s\n" "BRANCH" "FLAGS" "A/B" "AGE" "TTL" "PATH"
+  fi
+
+  local first_json=1
+  local now_epoch="$(_wt_now_epoch)"
+
+  local IFS=$'\n'
+  for line in $discovered; do
+    [ -n "$line" ] || continue
+    local path branch flags dirty_flag ephemeral ttlHours createdEpoch created ageHours ahead behind expired_flag ttl_display
+    path="${line%%$'\t'*}"
+    branch="${line##*$'\t'}"
+
+    dirty_flag=""
+    if _wt_is_dirty "$path"; then dirty_flag="*"; fi
+
+    ephemeral="false"
+    ttlHours=""
+    createdEpoch=""
+    created=""
+    expired_flag=""
+    ttl_display="-"
+    if _wt_is_ephemeral "$path"; then
+      ephemeral="true"
+      ttlHours="$(_wt_entry_field "$path" ttlHours 2>/dev/null || true)"
+      createdEpoch="$(_wt_entry_field "$path" createdEpoch 2>/dev/null || true)"
+      created="$(_wt_entry_field "$path" created 2>/dev/null || true)"
+      if [ -n "$createdEpoch" ]; then
+        ageHours=$(( (now_epoch - createdEpoch)/3600 ))
+      else
+        ageHours="?"
+      fi
+      if [ -n "$ttlHours" ]; then
+        ttl_display="${ttlHours}h"
+      fi
+      if _wt_is_expired "$path"; then
+        expired_flag="!"
+      fi
+    fi
+    [ -n "$ageHours" ] || ageHours="0"
+
+    ahead=""; behind=""
+    if ab="$(_wt_ahead_behind "$path" 2>/dev/null || true)"; then
+      ahead="${ab%% *}"
+      behind="${ab##* }"
+    else
+      ahead="0"; behind="0"
+    fi
+
+    # Flags column
+    flags=""
+    if [ "$ephemeral" = "true" ]; then
+      flags="e${expired_flag}"
+    fi
+    if [ -n "$dirty_flag" ]; then
+      # Dirty marker precedes ephemeral marker per earlier spec or follow spec? We'll put dirty first.
+      flags="*${flags}"
+    fi
+
+    # Skip expired unless --show-expired
+    if [ "$expired_flag" = "!" ] && [ "$show_expired" = "0" ]; then
+      :
+      # still included by design? spec: show only with --show-expired
+      continue
+    fi
+
+    if [ "$json" = "1" ]; then
+      [ "$first_json" = "1" ] || echo ","
+      first_json=0
+      echo "  {"
+      echo "    \"path\": \"${path}\","
+      echo "    \"branch\": \"${branch}\","
+      echo "    \"ephemeral\": ${ephemeral},"
+      if [ -n "$dirty_flag" ]; then
+        echo '    "dirty": true,'
+      else
+        echo '    "dirty": false,'
+      fi
+      echo "    \"ahead\": ${ahead},"
+      echo "    \"behind\": ${behind},"
+      if [ -n "$ttlHours" ]; then
+        echo "    \"ttlHours\": ${ttlHours},"
+      fi
+      if [ -n "$created" ]; then
+        echo "    \"created\": \"${created}\","
+      fi
+      if [ -n "$createdEpoch" ]; then
+        echo "    \"createdEpoch\": ${createdEpoch},"
+      fi
+      if [ "$ephemeral" = "true" ]; then
+        if [ "$expired_flag" = "!" ]; then
+          echo '    "expired": true'
+        else
+          echo '    "expired": false'
+        fi
+      else
+        echo "    \"expired\": false"
+      fi
+      echo "  }"
+    else
+      printf "%-15s %-5s %3s/%-3s %4sh %-6s %s\n" \
+        "$branch" "$flags" "$ahead" "$behind" "$ageHours" "$ttl_display" "$path"
+    fi
+  done
+
+  if [ "$json" = "1" ]; then
+    echo "]}"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Command: add
+# -----------------------------------------------------------------------------
+_wt_cmd_add() {
+  local branch="" path="" ephemeral=0 ttl_raw="" baseRef=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --branch) branch="$2"; shift 2;;
+      --ephemeral) ephemeral=1; shift;;
+      --ttl) ttl_raw="$2"; shift 2;;
+      --base-ref) baseRef="$2"; shift 2;;
+      -h|--help)
+        cat <<EOF
+Usage: gex worktree add [<path>] --branch <existing_branch> [--ephemeral] [--ttl <dur>] [--base-ref <ref>]
+
+Add an existing branch into a new worktree directory.
+If <path> is omitted it is inferred as: <repo-root>-wt/<branch-with-slashes-replaced>
+
+Examples:
+  gex worktree add --branch feature/login
+  gex worktree add ../repo-wt/login --branch feature/login
+  gex worktree add --branch feature/xyz --ephemeral --ttl 24h
+
+Options:
+  --branch <name>       Existing local branch (required)
+  --ephemeral           Mark this worktree as ephemeral (creates TTL metadata)
+  --ttl <duration>      TTL (e.g. 72h, 2d, 90m) (default from config if --ephemeral)
+  --base-ref <ref>      Base reference to record in metadata (no effect on Git content)
+EOF
+        return 0
+        ;;
+      -*)
+        gex_die "Unknown option for add: $1"
+        ;;
+      *)
+        if [ -z "$path" ]; then
+          path="$1"; shift
+        else
+          gex_die "Unexpected argument: $1"
+        fi
+        ;;
+    esac
+  done
+
+  [ -n "$branch" ] || gex_die "--branch required."
+  git show-ref --verify "refs/heads/${branch}" >/dev/null 2>&1 || gex_die "Branch '$branch' does not exist."
+
+  # Infer path if omitted
+  if [ -z "$path" ]; then
+    local repo_root path_base
+    repo_root="$(_wt_repo_root)"
+    path_base="${repo_root}-wt"
+    mkdir -p "$path_base"
+    path="${path_base}/${branch//\//-}"
+    gex_info "Inferred path from branch: $path"
+  fi
+
+  # Ensure target path does not already exist with files
+  if [ -e "$path" ]; then
+    if [ -d "$path" ] && [ -z "$(ls -A "$path" 2>/dev/null || true)" ]; then
+      :
+    else
+      gex_die "Path '$path' exists and is not an empty directory."
+    fi
+  fi
+
+  git worktree add "$path" "$branch"
+
+  _wt_load_metadata
+  local created createdEpoch ttlHours
+  created="$(_wt_now_rfc3339)"
+  createdEpoch="$(_wt_now_epoch)"
+  ttlHours=""
+  local ephemeral_flag="false"
+  if [ "$ephemeral" = "1" ]; then
+    ephemeral_flag="true"
+    ttlHours="$(_wt_parse_ttl_hours "${ttl_raw:-$(_wt_cfg_default_ttl)}")"
+  fi
+  _wt_upsert_entry "$(cd "$path" && pwd -P)" "$branch" "$created" "$createdEpoch" "$ephemeral_flag" "$ttlHours" "$baseRef" "$([ "$ephemeral_flag" = "true" ] && echo "ephemeral" || echo "add")"
+  _wt_save_metadata
+  gex_info "Worktree added: $path (branch: $branch${ephemeral_flag:+, ephemeral})"
+}
+
+# -----------------------------------------------------------------------------
+# Command: create
+# -----------------------------------------------------------------------------
+_wt_cmd_create() {
+  local branch="" path="" from_ref="" ephemeral=0 ttl_raw=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --branch) branch="$2"; shift 2;;
+      --from) from_ref="$2"; shift 2;;
+      --ephemeral) ephemeral=1; shift;;
+      --ttl) ttl_raw="$2"; shift 2;;
+      -h|--help)
+        cat <<EOF
+Usage: gex worktree create [<path>] --branch <new_branch> [--from <base_ref>] [--ephemeral] [--ttl <dur>]
+
+Create a new branch and worktree at once.
+If <path> is omitted it is inferred as: <repo-root>-wt/<branch-with-slashes-replaced>
+
+Examples:
+  gex worktree create --branch feature/login --from origin/main
+  gex worktree create --branch spike/idea --ephemeral --ttl 8h
+  gex worktree create ../repo-wt/tmp --branch spike/idea --ephemeral --ttl 8h
+
+Options:
+  --branch <name>   New branch name (required)
+  --from <ref>      Base ref (default: origin/main if exists, else main, else current HEAD)
+  --ephemeral       Mark as ephemeral (with TTL)
+  --ttl <dur>       TTL for ephemeral (e.g. 24h, 2d, 90m)
+EOF
+        return 0
+        ;;
+      -*)
+        gex_die "Unknown option for create: $1"
+        ;;
+      *)
+        if [ -z "$path" ]; then
+          path="$1"; shift
+        else
+          gex_die "Unexpected argument: $1"
+        fi
+        ;;
+    esac
+  done
+  [ -n "$branch" ] || gex_die "--branch required."
+  if [ -z "$path" ]; then
+    repo_root="$(_wt_repo_root)"
+    path_base="${repo_root}-wt"
+    mkdir -p "$path_base"
+    path="${path_base}/${branch//\//-}"
+    gex_info "Inferred path from branch: $path"
+  fi
+
+  if [ -z "$from_ref" ]; then
+    if git rev-parse --verify origin/main >/dev/null 2>&1; then
+      from_ref="origin/main"
+    elif git rev-parse --verify main >/dev/null 2>&1; then
+      from_ref="main"
+    else
+      from_ref="$(git rev-parse HEAD)"
+    fi
+  fi
+
+  git worktree add -b "$branch" "$path" "$from_ref"
+
+  # Set upstream if from_ref looks like remote/branch
+  if [[ "$from_ref" == */* ]]; then
+    git -C "$path" branch --set-upstream-to "$from_ref" "$branch" >/dev/null 2>&1 || true
+  fi
+
+  _wt_load_metadata
+  local created createdEpoch ttlHours
+  created="$(_wt_now_rfc3339)"
+  createdEpoch="$(_wt_now_epoch)"
+  ttlHours=""
+  local ephemeral_flag="false"
+  if [ "$ephemeral" = "1" ]; then
+    ephemeral_flag="true"
+    ttlHours="$(_wt_parse_ttl_hours "${ttl_raw:-$(_wt_cfg_default_ttl)}")"
+  fi
+  _wt_upsert_entry "$(cd "$path" && pwd -P)" "$branch" "$created" "$createdEpoch" "$ephemeral_flag" "$ttlHours" "$from_ref" "$([ "$ephemeral_flag" = "true" ] && echo "ephemeral" || echo "create")"
+  _wt_save_metadata
+  gex_info "Created worktree: $path (branch: $branch from $from_ref${ephemeral_flag:+, ephemeral})"
+}
+
+# -----------------------------------------------------------------------------
+# Command: ephemeral
+# -----------------------------------------------------------------------------
+_wt_cmd_ephemeral() {
+  local name="" from_ref="" ttl_raw=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from) from_ref="$2"; shift 2;;
+      --ttl) ttl_raw="$2"; shift 2;;
+      -h|--help)
+        cat <<EOF
+Usage: gex worktree ephemeral [<name>] [--from <base_ref>] [--ttl <dur>]
+
+Create an ephemeral worktree + branch with a TTL (branch always created).
+
+If <name> omitted, a generated name is used: <prefix>/YYYYMMDD-rand (prefix from config: gex.worktree.ephemeralPrefix, default 'wt').
+
+Examples:
+  gex worktree ephemeral
+  gex worktree ephemeral spike-idea --ttl 8h --from origin/main
+  gex worktree ephemeral hotfix-123 --ttl 24h
+
+Flags:
+  --from <ref>   Base ref (default origin/main or main fallback as in create)
+  --ttl <dur>    TTL duration (e.g. 72h, 2d, 90m) (default config)
+EOF
+        return 0
+        ;;
+      -*)
+        gex_die "Unknown option for ephemeral: $1"
+        ;;
+      *)
+        if [ -z "$name" ]; then
+          name="$1"; shift
+        else
+          gex_die "Unexpected argument: $1"
+        fi
+        ;;
+    esac
+  done
+
+  if [ -z "$name" ]; then
+    name="$(_wt_generate_ephemeral_name)"
+  else
+    # Ensure prefix pattern maybe user provided; keep as is.
+    :
+  fi
+
+  # Branch name identical to name (sanitize spaces)
+  local branch
+  branch="$(echo "$name" | tr ' ' '-' )"
+
+  # Determine path: <repo-root>-wt/<branch>
+  local repo_root path_base
+  repo_root="$(_wt_repo_root)"
+  path_base="${repo_root}-wt"
+  mkdir -p "$path_base"
+  local path="${path_base}/${branch//\//-}" # Directory name replace slashes to avoid nested trees unexpectedly.
+
+  # Reuse create logic: always ephemeral
+  local args=( "$path" --branch "$branch" --ephemeral )
+  [ -n "$from_ref" ] && args+=( --from "$from_ref" )
+  [ -n "$ttl_raw" ] && args+=( --ttl "$ttl_raw" )
+  _wt_cmd_create "${args[@]}"
+  echo "$path"
+}
+
+# -----------------------------------------------------------------------------
+# Command: prune
+# -----------------------------------------------------------------------------
+_wt_cmd_prune() {
+  local apply=0 force=0 ephemeral_only=0 expired_only=0 json=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --apply) apply=1; shift;;
+      --force) force=1; shift;;
+      --ephemeral-only) ephemeral_only=1; shift;;
+      --expired-only) expired_only=1; shift;;
+      --json) json=1; shift;;
+      -h|--help)
+        cat <<EOF
+Usage: gex worktree prune [--apply] [--force] [--ephemeral-only] [--expired-only] [--json]
+
+Remove (by default: dry-run) non-root worktrees with safety checks.
+
+Filters:
+  --ephemeral-only  Consider only ephemeral worktrees
+  --expired-only    Consider only expired ephemeral worktrees (implies ephemeral-only)
+
+Modes:
+  (default)         Dry-run mode (reports what would be removed)
+  --apply           Perform deletions
+
+Safety:
+  Skips dirty worktrees unless --force
+  Skips ahead-of-upstream worktrees unless --force
+
+Examples:
+  gex worktree prune
+  gex worktree prune --ephemeral-only
+  gex worktree prune --expired-only --apply
+  gex worktree prune --expired-only --apply --force
+
+JSON Output:
+  Includes: mode, removed[], skipped[] (with reason)
+EOF
+        return 0
+        ;;
+      -*)
+        gex_die "Unknown option for prune: $1"
+        ;;
+      *)
+        gex_die "Unexpected argument to prune: $1"
+        ;;
+    esac
+  done
+  [ "$expired_only" = "1" ] && ephemeral_only=1
+
+  local repo_root discovered
+  repo_root="$(_wt_repo_root)"
+  discovered="$(_wt_discover_git_worktrees)"
+
+  local removed=() skipped=()
+  local IFS=$'\n'
+  for line in $discovered; do
+    [ -n "$line" ] || continue
+    local path branch
+    path="${line%%$'\t'*}"
+    branch="${line##*$'\t'}"
+    [ "$path" = "$repo_root" ] && continue
+
+    local is_ephemeral="false"
+    if _wt_is_ephemeral "$path"; then
+      is_ephemeral="true"
+    fi
+
+    if [ "$ephemeral_only" = "1" ] && [ "$is_ephemeral" != "true" ]; then
+      continue
+    fi
+
+    local expired="false"
+    if _wt_is_expired "$path"; then
+      expired="true"
+    fi
+    if [ "$expired_only" = "1" ] && [ "$expired" != "true" ]; then
+      continue
+    fi
+
+    # Determine skip reasons
+    local dirty ahead behind
+    dirty=0
+    if _wt_is_dirty "$path"; then dirty=1; fi
+    ahead=0; behind=0
+    if ab="$(_wt_ahead_behind "$path" 2>/dev/null || true)"; then
+      ahead="${ab%% *}"
+      behind="${ab##* }"
+    fi
+
+    local reason=""
+    if [ "$force" != "1" ]; then
+      if [ "$dirty" = "1" ]; then reason="dirty"; fi
+      if [ -z "$reason" ] && [ "$ahead" -gt 0 ]; then reason="ahead"; fi
+    fi
+
+    if [ -n "$reason" ]; then
+      skipped+=("$path|$reason")
+      continue
+    fi
+
+    # Candidate
+    if [ "$apply" = "1" ]; then
+      if [ -d "$path" ]; then
+        rm -rf "$path" || { skipped+=("$path|rm-failed"); continue; }
+      fi
+      _wt_remove_entry "$path"
+      removed+=("$path")
+    else
+      removed+=("$path|dryrun")
+    fi
+  done
+
+  if [ "$apply" = "1" ]; then
+    git worktree prune >/dev/null 2>&1 || true
+    _wt_save_metadata
+  fi
+
+  if [ "$json" = "1" ]; then
+    echo "{"
+    local mode_value
+    if [ "$apply" = "1" ]; then
+      mode_value="applied"
+    else
+      mode_value="dry-run"
+    fi
+    echo "  \"mode\": \"${mode_value}\","
+    echo "  \"removed\": ["
+    local first=1
+    local r
+    for r in "${removed[@]}"; do
+      local path="${r%%|*}"
+      local tag="${r##*|}"
+      if [ "$tag" = "$path" ]; then tag=""; fi
+      [ "$first" = "1" ] || echo ","
+      first=0
+      echo -n "    {\"path\":\"$path\""
+      [ "$tag" = "dryrun" ] && echo -n ",\"dryRun\":true"
+      echo "}"
+    done
+    echo "  ],"
+    echo "  \"skipped\": ["
+    first=1
+    for r in "${skipped[@]}"; do
+      local path="${r%%|*}"
+      local reason="${r##*|}"
+      [ "$first" = "1" ] || echo ","
+      first=0
+      echo "    {\"path\":\"$path\",\"reason\":\"$reason\"}"
+    done
+    echo "  ]"
+    echo "}"
+    return 0
+  fi
+
+  # Human output
+  local removed_count=0 removed_apply=0
+  for r in "${removed[@]}"; do
+    local path="${r%%|*}"
+    local tag="${r##*|}"
+    if [ "$tag" = "dryrun" ]; then
+      echo "WOULD REMOVE: $path"
+    else
+      echo "REMOVED: $path"
+      removed_apply=$((removed_apply+1))
+    fi
+    removed_count=$((removed_count+1))
+  done
+  local skip
+  for skip in "${skipped[@]}"; do
+    local path="${skip%%|*}"
+    local reason="${skip##*|}"
+    echo "SKIP: $path (reason: $reason)"
+  done
+  if [ "$apply" = "1" ]; then
+    echo "Summary: removed $removed_apply, skipped ${#skipped[@]}"
+  else
+    echo "Summary (dry-run): would remove $removed_count, skipped ${#skipped[@]}. Use --apply to proceed."
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Help (top-level for worktree)
+# -----------------------------------------------------------------------------
+_wt_print_help() {
+  cat <<EOF
+Usage: gex worktree <subcommand> [options]
+
+Subcommands (Phase 1):
+  list        List worktrees (with ephemeral + TTL info)
+  add         Add existing branch to new worktree
+  create      Create new branch + worktree
+  ephemeral   Convenience ephemeral (branch+worktree)
+  prune       Remove worktrees (dry-run by default)
+
+Ephemeral / TTL:
+  Ephemeral worktrees hold metadata (ttlHours). Upon expiration:
+    - On any 'gex worktree' command, expired ephemeral worktrees are detected.
+    - Auto-delete behavior controlled by config 'gex.worktree.ttl.autoDelete':
+        prompt (default) | force | off
+    - Safe deletion only if clean and not ahead (unless you force in future phases).
+
+Examples:
+  gex worktree list
+  gex worktree ephemeral --ttl 8h
+  gex worktree add ../repo-wt/feat --branch feature/abc --ephemeral --ttl 24h
+  gex worktree prune --expired-only
+  gex worktree prune --expired-only --apply --force
+
+Run 'gex worktree <subcommand> --help' for details.
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# Dispatcher
+# -----------------------------------------------------------------------------
+main() {
+  # Allow top-level help outside a git repository
+  if [ $# -lt 1 ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] || [ "${1:-}" = "help" ]; then
+    _wt_print_help
+    exit 0
+  fi
+
+  # For all other subcommands we require being inside a git repo
+  gex_require_git_repo
+
+  local sub="$1"; shift || true
+
+  # Load metadata once, perform TTL autoclean before executing mutating commands (all for now)
+  _wt_load_metadata
+  _wt_ttl_autoclean || true
+  # Reload metadata (clean may have modified)
+  _wt_load_metadata
+
+  case "$sub" in
+    list)       _wt_cmd_list "$@";;
+    add)        _wt_cmd_add "$@";;
+    create)     _wt_cmd_create "$@";;
+    ephemeral)  _wt_cmd_ephemeral "$@";;
+    prune)      _wt_cmd_prune "$@";;
+    -h|--help|help) _wt_print_help;;
+    *)
+      gex_die "Unknown worktree subcommand: $sub"
+      ;;
+  esac
+}
+
+main "$@"
