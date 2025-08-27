@@ -726,13 +726,15 @@ EOF
 # Command: create
 # -----------------------------------------------------------------------------
 _wt_cmd_create() {
-  local branch="" path="" from_ref="" ephemeral=0 ttl_raw=""
+  local branch="" path="" from_ref="" ephemeral=0 ttl_raw="" push=0 remote=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --branch) branch="$2"; shift 2;;
       --from) from_ref="$2"; shift 2;;
       --ephemeral) ephemeral=1; shift;;
       --ttl) ttl_raw="$2"; shift 2;;
+      --push) push=1; shift;;
+      --remote) remote="$2"; shift 2;;
       -h|--help)
         cat <<EOF
 Usage: gex worktree create [<path>] --branch <new_branch> [--from <base_ref>] [--ephemeral] [--ttl <dur>]
@@ -750,6 +752,8 @@ Options:
   --from <ref>      Base ref (default: origin/main if exists, else main, else current HEAD)
   --ephemeral       Mark as ephemeral (with TTL)
   --ttl <dur>       TTL for ephemeral (e.g. 24h, 2d, 90m)
+  --push            Push new branch to remote and set upstream
+  --remote <name>   Remote to use with --push (default: origin)
 EOF
         return 0
         ;;
@@ -803,21 +807,27 @@ EOF
   fi
   _wt_upsert_entry "$(cd "$path" && pwd -P)" "$branch" "$created" "$createdEpoch" "$ephemeral_flag" "$ttlHours" "$from_ref" "$([ "$ephemeral_flag" = "true" ] && echo "ephemeral" || echo "create")"
   _wt_save_metadata
-  gex_info "Created worktree: $path (branch: $branch from $from_ref${ephemeral_flag:+, ephemeral})"
+  if [ "$push" = "1" ]; then
+    [ -z "$remote" ] && remote="origin"
+    git -C "$path" push -u "$remote" "$branch" || gex_warn "Failed to push new branch to $remote"
+  fi
+  gex_info "Created worktree: $path (branch: $branch from $from_ref${ephemeral_flag:+, ephemeral}${push:+, pushed})"
 }
 
 # -----------------------------------------------------------------------------
 # Command: ephemeral
 # -----------------------------------------------------------------------------
 _wt_cmd_ephemeral() {
-  local name="" from_ref="" ttl_raw=""
+  local name="" from_ref="" ttl_raw="" push=0 remote=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --from) from_ref="$2"; shift 2;;
       --ttl) ttl_raw="$2"; shift 2;;
+      --push) push=1; shift;;
+      --remote) remote="$2"; shift 2;;
       -h|--help)
         cat <<EOF
-Usage: gex worktree ephemeral [<name>] [--from <base_ref>] [--ttl <dur>]
+Usage: gex worktree ephemeral [<name>] [--from <base_ref>] [--ttl <dur>] [--push] [--remote <r>]
 
 Create an ephemeral worktree + branch with a TTL (branch always created).
 
@@ -831,6 +841,8 @@ Examples:
 Flags:
   --from <ref>   Base ref (default origin/main or main fallback as in create)
   --ttl <dur>    TTL duration (e.g. 72h, 2d, 90m) (default config)
+  --push         Push new branch and set upstream
+  --remote <r>   Remote for push (default origin)
 EOF
         return 0
         ;;
@@ -869,6 +881,8 @@ EOF
   local args=( "$path" --branch "$branch" --ephemeral )
   [ -n "$from_ref" ] && args+=( --from "$from_ref" )
   [ -n "$ttl_raw" ] && args+=( --ttl "$ttl_raw" )
+  [ "$push" = "1" ] && args+=( --push )
+  [ -n "$remote" ] && args+=( --remote "$remote" )
   _wt_cmd_create "${args[@]}"
   echo "$path"
 }
