@@ -31,6 +31,16 @@ gex graph --interactive           # Interactive branch selection (fzf)
 gex graph --branches "feature/*"  # Filter branches
 ```
 
+### Worktree Management
+```bash
+gex worktree list                   # List worktrees (dirty, ahead/behind, TTL)
+gex worktree add --branch feat/x    # Add existing branch (path inferred)
+gex worktree create --branch feat/y # Create branch+worktree (path inferred)
+gex worktree ephemeral --ttl 8h     # Create ephemeral worktree (temporary)
+gex worktree prune --expired-only   # Dry-run prune expired ephemerals
+gex worktree prune --expired-only --apply  # Apply pruning
+```
+
 ### Configuration
 ```bash
 gex config set <key> <value>      # Set configuration

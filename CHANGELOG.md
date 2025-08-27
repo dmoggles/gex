@@ -31,6 +31,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Dry-run mode for previewing operations
   - Configuration support for default strategies and behaviors
 
+- **`gex worktree`** - Multi-worktree management (Phase 1)
+  - Subcommands: `list`, `add`, `create`, `ephemeral`, `prune`
+  - Ephemeral worktrees with TTL (auto detection & prompt/force/off removal modes)
+  - Path inference for `add` and `create` (branch-derived directories)
+  - JSON output for `list` and `prune`
+  - Safe pruning (dry-run by default, dirty/ahead protection, forced override)
+  - TTL auto-clean hook (safe expired ephemerals removable on any invocation)
+  - Metadata persisted in `.gex/worktrees.json` (versioned)
+  - Configurable defaults via `gex.worktree.*` keys (ttl, prefix, autoDelete mode)
+
 ## [1.0.0] - 2024-08-24
 
 ### Major Release - Production Ready

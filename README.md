@@ -4,7 +4,7 @@ A lightweight, extensible command-line tool that enhances Git workflows with int
 
 **gex** provides high-level commands that wrap common Git operations, making complex workflows simple and safe while preserving the full power of Git underneath.
 
-> **Status**: Production ready. Core commands: `graph`, `start`, `publish`, `snip`, `squash`, `sync`, `wip`, `config`
+> **Status**: Production ready. Core commands: `graph`, `start`, `publish`, `snip`, `squash`, `sync`, `wip`, `worktree`, `config`
 
 ---
 
@@ -21,6 +21,7 @@ A lightweight, extensible command-line tool that enhances Git workflows with int
   - [squash - Combine multiple commits](#squash)
   - [sync - Synchronize with upstream branches](#sync)
   - [wip - Quick work-in-progress commits](#wip)
+  - [worktree - Manage multiple worktrees (list/add/create/ephemeral/prune)](#worktree)
   - [config - Manage configuration](#config)
 - [Configuration](#configuration)
 - [Workflows](#workflows)
@@ -876,6 +877,168 @@ gex wip [message] [options]
 # Quick WIP commit
 gex wip "checkpoint before refactor"
 # Creates: "WIP: checkpoint before refactor"
+
+---
+
+## worktree
+
+**Manage multiple Git worktrees with lifecycle, TTL, and cleanup utilities.**
+
+The `worktree` command streamlines working with multiple branches in parallel by wrapping native `git worktree` functionality and layering metadata (ephemeral status, TTL, base refs) for automation and safety.
+
+### Subcommands (Phase 1)
+
+| Subcommand | Description |
+|------------|-------------|
+| `list` | List all worktrees with metadata (dirty, ahead/behind, ephemeral, TTL) |
+| `add` | Add an existing branch in a new worktree (path inferred if omitted) |
+| `create` | Create a new branch and worktree together (path inferred if omitted) |
+| `ephemeral` | Create an ephemeral (temporary) branch+worktree with TTL |
+| `prune` | Remove (dry-run by default) selected worktrees (filters & safety) |
+
+### Syntax
+```bash
+gex worktree <subcommand> [options]
+```
+
+### Ephemeral Worktrees
+
+Ephemeral worktrees are intended for short-lived tasks (spikes, reviews, experiments). They:
+- Always create a new branch
+- Are tagged with `ephemeral: true`
+- Have a TTL (default 72h, configurable)
+- Are auto-detected when expired; safe, clean, non-ahead ones can be auto-removed (prompt by default)
+
+### Path Inference
+
+For `add` and `create`, if you omit `<path>`, gex infers:
+```
+<repo-root>-wt/<branch-with-slashes-replaced>
+```
+Example:
+```bash
+gex worktree create --branch feature/login
+# -> /repo-root-wt/feature-login
+```
+
+### Common Workflows
+
+```bash
+# Create an ephemeral worktree from origin/main (default base)
+gex worktree ephemeral --ttl 8h
+
+# Add existing branch in inferred path
+gex worktree add --branch feature/refactor
+
+# Create a new branch + worktree (path inferred)
+gex worktree create --branch spike/db-migration --ephemeral --ttl 24h
+
+# List worktrees (hide expired ephemerals unless explicitly shown)
+gex worktree list
+gex worktree list --show-expired
+
+# Prune expired ephemeral worktrees (dry-run)
+gex worktree prune --expired-only
+
+# Apply pruning (actually delete) forcing removal of dirty/ahead (use with caution)
+gex worktree prune --expired-only --apply --force
+```
+
+### TTL Handling
+
+On any `gex worktree` invocation:
+1. Expired ephemeral worktrees are identified (created + ttlHours).
+2. Safe ones (clean & not ahead of upstream) are offered for deletion (prompt mode) or silently removed (force mode).
+3. Dirty or ahead ephemerals are skipped with a reason.
+
+Modes (config key `gex.worktree.ttl.autoDelete`):
+- `prompt` (default) – ask before deleting safe expired
+- `force` – delete safe expired without prompt
+- `off` – never auto-delete (manual prune only)
+
+### JSON Output
+
+Machine-friendly output for automation:
+```bash
+gex worktree list --json
+gex worktree prune --expired-only --json
+```
+
+Sample:
+```json
+{
+  "worktrees": [
+    {
+      "path": "/repo",
+      "branch": "main",
+      "ephemeral": false,
+      "dirty": false,
+      "ahead": 0,
+      "behind": 0,
+      "expired": false
+    },
+    {
+      "path": "/repo-wt/feature-login",
+      "branch": "feature/login",
+      "ephemeral": true,
+      "ttlHours": 72,
+      "created": "2025-09-02T09:10:11Z",
+      "createdEpoch": 1756813811,
+      "dirty": false,
+      "ahead": 0,
+      "behind": 0,
+      "expired": false
+    }
+  ]
+}
+```
+
+### Safety Rules
+
+- Root worktree (original repo path) is never pruned.
+- Dirty or ahead worktrees are skipped unless `--force` (prune).
+- Expired ephemeral deletion only acts on safe worktrees.
+- History-rewriting operations (future phases) will warn if multiple worktrees share a branch.
+
+### Configuration (initial keys)
+
+Add to `~/.config/gex/config` or `.gexrc`:
+```ini
+gex.worktree.defaultTtlHours = 72
+gex.worktree.ttl.autoDelete = prompt    # prompt|force|off
+gex.worktree.ephemeralPrefix = wt
+```
+
+### Examples In Context
+
+```bash
+# Rapid spike
+gex worktree ephemeral --ttl 4h
+# ... experiment ...
+gex worktree list          # See remaining TTL
+# After it expires:
+gex worktree list          # Prompt to remove if safe
+
+# Bulk cleanup
+gex worktree prune --ephemeral-only      # Dry-run
+gex worktree prune --ephemeral-only --apply
+```
+
+### Future Enhancements (Planned)
+
+(Will arrive in later phases)
+- `exec` across worktrees
+- `status` aggregation
+- `review` (PR branch worktree)
+- `keep` (promote ephemeral to permanent)
+- Multi-worktree `graph` highlighting
+
+Run:
+```bash
+gex worktree --help
+gex worktree <subcommand> --help
+```
+for the latest usage details.
 
 # WIP without message
 gex wip
